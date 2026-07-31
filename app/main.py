@@ -17,26 +17,50 @@ allowed_periods = [
 app = FastAPI()
 
 @app.get("/stock")
+def get_stock(
+    symbol: str,
+    period: str | None = None,
+    start: str | None = None,
+    end: str | None = None
+):
 
-def get_stock(symbol: str , period: str = "1mo"):
+    if period and period not in allowed_periods:
+        raise HTTPException(
+            status_code=400,
+            detail="Invalid period"
+        )
 
-    if period not in allowed_periods:
-     raise HTTPException(
-        status_code=400,
-        detail="Invalid period"
-    )
+    if (start and not end) or (end and not start):
+        raise HTTPException(
+            status_code=400,
+            detail="Both start and end dates are required."
+        )
+
+    if period and start and end:
+        raise HTTPException(
+            status_code=400,
+            detail="Use either period OR start/end dates, not both."
+        )
+
+    if not period and not start and not end:
+        period = "1mo"
+
+        #Date format: YYYY-MM-DD (ISO 8601)
 
     try:
-     
-
-        data = download_stock_data(symbol, period)
+        data = download_stock_data(
+            symbol=symbol,
+            period=period,
+            start=start,
+            end=end
+        )
 
         data = calculate_daily_returns(data)
 
         latest_day = data.iloc[-1]
         latest_price = latest_day["Close"]
-        data = data.replace({np.nan: None})
 
+        data = data.replace({np.nan: None})
         history = data.to_dict(orient="records")
 
         return {
@@ -48,11 +72,7 @@ def get_stock(symbol: str , period: str = "1mo"):
         }
 
     except Exception:
-
         raise HTTPException(
-
             status_code=404,
-
             detail="Invalid stock symbol"
-
         )

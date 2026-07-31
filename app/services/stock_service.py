@@ -20,9 +20,13 @@ s3 = boto3.client(
     region_name=AWS_REGION,
 )
 
-def download_stock_data(symbol, period="1mo"):
+def download_stock_data(symbol, period="1mo", start=None, end=None):
  ticker = yf.Ticker(symbol)
- data   = ticker.history(period=period)
+ if start and end:
+    data = ticker.history(start=start, end=end)
+ else:
+
+    data = ticker.history(period=period)
 
  if data.empty: 
      raise Exception("Invalid stock symbol")  
