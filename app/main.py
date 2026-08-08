@@ -1,7 +1,8 @@
 from fastapi import FastAPI , HTTPException
-from app.services.stock_service import download_stock_data
-from app.services.stock_service import calculate_daily_returns
+from app.services.stock_service import download_stock_data, calculate_daily_returns
+
 import numpy as np
+from app.services.analytics_service import calculate_summary
 allowed_periods = [
     "1d",
     "5d",
@@ -54,22 +55,22 @@ def get_stock(
             start=start,
             end=end
         )
-
+        print(data.tail())
+        
         data = calculate_daily_returns(data)
-
-        latest_day = data.iloc[-1]
-        latest_price = latest_day["Close"]
+        data = data.dropna(subset=["Close"])
+        summary = calculate_summary(data)
 
         data = data.replace({np.nan: None})
         history = data.to_dict(orient="records")
 
         return {
-            "stock": {
-                "symbol": symbol,
-                "latest_price": latest_price
-            },
-            "history": history
-        }
+    "stock": {
+        "symbol": symbol
+    },
+    "summary": summary,
+    "history": history
+ }
 
     except Exception:
         raise HTTPException(
