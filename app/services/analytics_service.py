@@ -11,6 +11,9 @@ def calculate_summary(data):
     first_close = data["Close"].iloc[0]
     last_close = data["Close"].iloc[-1]
     daily_returns = data["Daily Return"].dropna()
+    running_peak = data["Close"].cummax()
+    drawdown = (data["Close"] - running_peak) / running_peak * 100
+    max_drawdown = drawdown.min()
 
     if daily_returns.empty:
      average_daily_return = None
@@ -26,6 +29,13 @@ def calculate_summary(data):
       volatility = daily_returns.std()
 
     total_return = (last_close - first_close) / first_close * 100
+    if len(daily_returns) < 2:
+
+      volatility = None
+
+    else:
+
+     volatility = daily_returns.std()
 
     return {
     "latest_price": float(latest_price),
@@ -42,6 +52,11 @@ def calculate_summary(data):
     "volatility": (
         round(float(volatility), 2)
         if volatility is not None
+        else None
+    ),
+    "max_drawdown": (
+        round(float(max_drawdown), 2)
+        if max_drawdown is not None
         else None
     )
 }

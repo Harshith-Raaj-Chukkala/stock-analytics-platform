@@ -29,7 +29,7 @@ def download_stock_data(symbol, period="1mo", start=None, end=None):
     data = ticker.history(period=period)
 
  if data.empty: 
-     raise Exception("Invalid stock symbol")  
+     return data
  
  filename = f"data/{symbol}.csv"
  data.to_csv(filename)

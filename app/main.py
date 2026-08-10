@@ -55,6 +55,15 @@ def get_stock(
             start=start,
             end=end
         )
+        print("DATA RECEIVED")
+
+        print(data)
+        
+        if data.empty:
+         raise HTTPException(
+         status_code=404,
+         detail="No trading data available for the requested date range."
+    )
         print(data.tail())
         
         data = calculate_daily_returns(data)
@@ -72,8 +81,12 @@ def get_stock(
     "history": history
  }
 
+    except HTTPException:
+        raise
+
     except Exception:
         raise HTTPException(
             status_code=404,
             detail="Invalid stock symbol"
         )
+  
