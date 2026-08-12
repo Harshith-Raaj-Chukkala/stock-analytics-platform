@@ -67,6 +67,7 @@ def get_stock(
         print(data.tail())
         
         data = calculate_daily_returns(data)
+        data["Moving Average 20"] = data["Close"].rolling(20).mean()
         data = data.dropna(subset=["Close"])
         summary = calculate_summary(data)
 

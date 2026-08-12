@@ -14,6 +14,7 @@ def calculate_summary(data):
     running_peak = data["Close"].cummax()
     drawdown = (data["Close"] - running_peak) / running_peak * 100
     max_drawdown = drawdown.min()
+    
 
     if daily_returns.empty:
      average_daily_return = None
