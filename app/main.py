@@ -23,7 +23,8 @@ def get_stock(
     period: str | None = None,
     start: str | None = None,
     end: str | None = None
-):
+): 
+    print("NEW CODE RUNNING")
 
     if period and period not in allowed_periods:
         raise HTTPException(
@@ -70,7 +71,7 @@ def get_stock(
         data["Moving Average 20"] = data["Close"].rolling(20).mean()
         data = data.dropna(subset=["Close"])
         summary = calculate_summary(data)
-
+        
         data = data.replace({np.nan: None})
         history = data.to_dict(orient="records")
 
@@ -85,9 +86,11 @@ def get_stock(
     except HTTPException:
         raise
 
-    except Exception:
+    except ValueError as ve:
         raise HTTPException(
-            status_code=404,
-            detail="Invalid stock symbol"
+            status_code=400,
+            detail=str(ve)
         )
-  
+    except Exception as e:
+      print("ACTUAL ERROR:", repr(e))
+      raise

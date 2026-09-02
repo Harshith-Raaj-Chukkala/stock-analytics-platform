@@ -21,13 +21,57 @@ def calculate_summary(data):
     else:
      average_daily_return = daily_returns.mean()
 
-    if daily_returns.empty:
+    
 
-      volatility = None
+    gains = data["Daily Return"].clip(lower=0)
 
-    else:
+    losses = data["Daily Return"].clip(upper=0).abs()
+    average_gain = gains.rolling(14).mean()      
+    average_loss = losses.rolling(14).mean()
 
-      volatility = daily_returns.std()
+    rs = average_gain / average_loss
+    rsi = 100 - (100 / (1 + rs))
+
+    rsi = rsi.mask(
+    (average_loss == 0) & (average_gain > 0),
+    100
+)
+
+    rsi = rsi.mask(
+    (average_loss == 0) & (average_gain == 0),
+    50
+)
+
+
+    data["RSI"] = rsi
+    valid_rsi = data["RSI"].dropna()
+
+    if valid_rsi.empty:
+
+      latest_rsi = None
+
+      rsi_interpretation = None
+    else: 
+        latest_rsi = data["RSI"].dropna().iloc[-1]
+        if latest_rsi > 70:
+         rsi_interpretation = "Very strong upward momentum"
+
+        elif latest_rsi > 55:
+
+         rsi_interpretation = "Strong upward momentum"
+
+        elif latest_rsi >= 45:
+
+         rsi_interpretation = "Neutral momentum"
+
+        elif latest_rsi >= 30:
+
+         rsi_interpretation = "Weak downward momentum"
+
+        else:
+
+         rsi_interpretation = "Strong downward momentum"
+
 
     total_return = (last_close - first_close) / first_close * 100
     if len(daily_returns) < 2:
@@ -38,6 +82,18 @@ def calculate_summary(data):
 
      volatility = daily_returns.std()
 
+    print(gains)
+    print(losses)
+    print("AVERAGE GAIN:")
+    print(average_gain)
+
+    print("AVERAGE LOSS:")
+    print(average_loss)
+    print("RS:")
+    print(rs)
+    print("RSI:")
+    print(rsi)
+    
     return {
     "latest_price": float(latest_price),
     "highest_price": float(highest_price),
@@ -59,6 +115,16 @@ def calculate_summary(data):
         round(float(max_drawdown), 2)
         if max_drawdown is not None
         else None
-    )
+    ),
+   "latest_rsi": (
+    round(float(latest_rsi), 2)
+    if latest_rsi is not None
+    else None
+),
+"rsi_interpretation": (
+    rsi_interpretation
+    if rsi_interpretation is not None
+    else None
+),
 }
- 
+
