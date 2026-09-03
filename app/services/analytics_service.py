@@ -14,6 +14,11 @@ def calculate_summary(data):
     running_peak = data["Close"].cummax()
     drawdown = (data["Close"] - running_peak) / running_peak * 100
     max_drawdown = drawdown.min()
+    data["EMA 12"] = data["Close"].ewm(span=12, adjust=False).mean()
+    data["EMA 26"] = data["Close"].ewm(span=26, adjust=False).mean()
+    data["MACD"] = data["EMA 12"] - data["EMA 26"]
+    data["Signal Line"] = data["MACD"].ewm(span=9, adjust=False).mean()
+    data["Histogram"] = data["MACD"] - data["Signal Line"]
     
 
     if daily_returns.empty:
@@ -71,6 +76,31 @@ def calculate_summary(data):
         else:
 
          rsi_interpretation = "Strong downward momentum"
+    
+    valid_macd = data.dropna(subset=["MACD", "Signal Line"])
+    if valid_macd.empty:
+        latest_macd = None
+        latest_signal = None
+        latest_histogram = None
+        macd_interpretation = None
+    else:
+        latest_macd = valid_macd["MACD"].iloc[-1]
+        latest_signal = valid_macd["Signal Line"].iloc[-1]
+        latest_histogram = valid_macd["Histogram"].iloc[-1]
+        prev_histogram = valid_macd["Histogram"].iloc[-2] if len(valid_macd) > 1 else None
+
+        if latest_macd > latest_signal:
+            if prev_histogram is not None and prev_histogram < 0 and latest_histogram > 0:
+                macd_interpretation = "Bullish crossover - momentum turning up"
+            else:
+                macd_interpretation = "Bullish - MACD above signal"
+        elif latest_macd < latest_signal:
+            if prev_histogram is not None and prev_histogram > 0 and latest_histogram < 0:
+                macd_interpretation = "Bearish crossover - momentum turning down"
+            else:
+                macd_interpretation = "Bearish - MACD below signal"
+        else:
+            macd_interpretation = "Neutral - MACD equals signal"
 
 
     total_return = (last_close - first_close) / first_close * 100
@@ -93,7 +123,17 @@ def calculate_summary(data):
     print(rs)
     print("RSI:")
     print(rsi)
-    
+    print("EMA 12:")
+    print(data["EMA 12"])
+    print("EMA 26:")
+    print(data["EMA 26"])
+    print("MACD:")
+    print(data["MACD"])
+    print("Signal Line:")
+    print(data["Signal Line"])
+    print("Histogram:")
+    print(data["Histogram"])
+
     return {
     "latest_price": float(latest_price),
     "highest_price": float(highest_price),
@@ -126,5 +166,26 @@ def calculate_summary(data):
     if rsi_interpretation is not None
     else None
 ),
+"latest_macd": (
+    round(float(latest_macd), 2)
+    if latest_macd is not None
+    else None
+),
+"latest_signal": (
+    round(float(latest_signal), 2)
+    if latest_signal is not None
+    else None
+),
+"latest_histogram": (
+    round(float(latest_histogram), 2)
+    if latest_histogram is not None
+    else None
+),
+"macd_interpretation": (
+    macd_interpretation
+    if macd_interpretation is not None
+    else None
+)
+
 }
 
