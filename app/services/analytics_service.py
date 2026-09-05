@@ -16,6 +16,7 @@ def calculate_summary(data):
     running_peak = data["Close"].cummax()
     drawdown = (data["Close"] - running_peak) / running_peak * 100
     max_drawdown = drawdown.min()
+    data["Moving Average 20"] = data["Close"].rolling(20).mean()
 
     
     data["EMA 12"] = data["Close"].ewm(span=12, adjust=False).mean()
