@@ -360,3 +360,56 @@ def calculate_summary(data):
             else None
         )
     }
+
+def compare_summaries(summary_a, summary_b):
+    comparison = {}
+
+    if (
+        summary_a["total_return_percent"] is not None
+        and summary_b["total_return_percent"] is not None
+    ):
+        comparison["total_return_difference"] = round(
+            summary_b["total_return_percent"]
+            - summary_a["total_return_percent"], 
+            2
+        )
+    else:
+        comparison["total_return_difference"] = None
+
+    if (
+        summary_a["average_daily_return"] is not None
+        and summary_b["average_daily_return"] is not None
+    ):
+        comparison["average_daily_return_difference"] = round(
+            summary_b["average_daily_return"]
+            - summary_a["average_daily_return"], 
+            2
+        )
+    else:
+        comparison["average_daily_return_difference"] = None
+
+    if (
+        summary_a["volatility"] is not None
+        and summary_b["volatility"] is not None
+    ):
+        comparison["volatility_difference"] = round(
+            summary_b["volatility"]
+            - summary_a["volatility"], 
+            2
+        )
+    else:
+        comparison["volatility_difference"] = None
+
+    if (
+        summary_a["max_drawdown"] is not None
+        and summary_b["max_drawdown"] is not None
+    ):
+        comparison["max_drawdown_difference"] = round(
+            summary_b["max_drawdown"]
+            - summary_a["max_drawdown"], 
+            2
+        )
+    else:
+        comparison["max_drawdown_difference"] = None
+
+    return comparison

@@ -2,7 +2,7 @@ from fastapi import FastAPI , HTTPException
 from app.services.stock_service import download_stock_data, calculate_daily_returns
 
 import numpy as np
-from app.services.analytics_service import calculate_summary
+from app.services.analytics_service import calculate_summary , compare_summaries 
 allowed_periods = [
     "1d",
     "5d",
@@ -24,6 +24,7 @@ def get_stock(
     start: str | None = None,
     end: str | None = None
 ): 
+
     print("NEW CODE RUNNING")
 
     if period and period not in allowed_periods:
@@ -48,6 +49,8 @@ def get_stock(
         period = "1mo"
 
         #Date format: YYYY-MM-DD (ISO 8601)
+    
+
 
     try:
         data = download_stock_data(
@@ -82,6 +85,85 @@ def get_stock(
     "summary": summary,
     "history": history
  }
+
+    except HTTPException:
+        raise
+
+    except ValueError as ve:
+        raise HTTPException(
+            status_code=400,
+            detail=str(ve)
+        )
+    except Exception as e:
+      print("ACTUAL ERROR:", repr(e))
+      raise
+
+from datetime import date
+@app.get("/compare")
+def compare_stocks(
+    symbol: str, 
+    start_a: date,
+    end_a: date,
+    start_b: date,
+    end_b: date
+): 
+    if start_a > end_a:
+     raise HTTPException(
+        status_code=400,
+        detail="Period A start date must be before or equal to the end date."
+    )
+
+    if start_b > end_b:
+     raise HTTPException(
+        status_code=400,
+        detail="Period B start date must be before or equal to the end date."
+    )
+    
+    if start_a == start_b and end_a == end_b:
+     raise HTTPException(
+        status_code=400,
+        detail="Period A and Period B cannot be identical."
+    )
+
+    try:
+        data_a = download_stock_data(symbol, start=start_a, end=end_a)
+        data_b = download_stock_data(symbol, start=start_b, end=end_b)
+
+        if data_a.empty:
+         raise HTTPException(
+        status_code=404,
+        detail="No trading data available for Period A."
+    )
+
+        if data_b.empty:
+         raise HTTPException(
+        status_code=404,
+        detail="No trading data available for Period B."
+    )
+        data_a = calculate_daily_returns(data_a)
+        data_b = calculate_daily_returns(data_b)
+
+        summary_a = calculate_summary(data_a)
+        summary_b = calculate_summary(data_b)
+
+        comparison = compare_summaries(summary_a, summary_b)
+
+        return {
+            "stock": {
+                "symbol": symbol
+            },
+            "period_a": {
+                "start": start_a,
+                "end": end_a,
+                "summary": summary_a
+            },
+            "period_b": {
+                "start": start_b,
+                "end": end_b,
+                "summary": summary_b
+            },
+            "comparison": comparison
+        }
 
     except HTTPException:
         raise
