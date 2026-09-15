@@ -413,3 +413,64 @@ def compare_summaries(summary_a, summary_b):
         comparison["max_drawdown_difference"] = None
 
     return comparison
+
+def compare_stock_summaries(summaries):
+    comparison = {}
+
+    valid_returns = {
+        symbol: summary["total_return_percent"]
+        for symbol, summary in summaries.items()
+        if summary["total_return_percent"] is not None
+    }
+
+    valid_average_returns = {
+        symbol: summary["average_daily_return"]
+        for symbol, summary in summaries.items()
+        if summary["average_daily_return"] is not None
+    }
+
+    valid_volatility = {
+        symbol: summary["volatility"]
+        for symbol, summary in summaries.items()
+        if summary["volatility"] is not None
+    }
+
+    valid_drawdown = {
+        symbol: summary["max_drawdown"]
+        for symbol, summary in summaries.items()
+        if summary["max_drawdown"] is not None
+    }
+
+    comparison["highest_return"] = (
+    max(valid_returns, key=valid_returns.get)
+    if valid_returns else None
+)
+
+    comparison["highest_average_daily_return"] = (
+    max(valid_average_returns, key=valid_average_returns.get)
+    if valid_average_returns else None
+)
+
+    comparison["lowest_volatility"] = (
+    min(valid_volatility, key=valid_volatility.get)
+    if valid_volatility else None
+)
+
+    comparison["best_drawdown"] = (
+    max(valid_drawdown, key=valid_drawdown.get)
+    if valid_drawdown else None
+)
+    if (
+    comparison["highest_return"]
+    and comparison["lowest_volatility"]
+    and comparison["best_drawdown"]
+):
+     comparison["interpretation"] = (
+        f"{comparison['highest_return']} had the highest return, while "
+        f"{comparison['lowest_volatility']} had the lowest volatility and "
+        f"{comparison['best_drawdown']} had the best drawdown."
+    )
+    else:
+        comparison["interpretation"] = None
+
+    return comparison

@@ -1,8 +1,8 @@
-from fastapi import FastAPI , HTTPException
+from fastapi import FastAPI , HTTPException , Query
 from app.services.stock_service import download_stock_data, calculate_daily_returns
 
 import numpy as np
-from app.services.analytics_service import calculate_summary , compare_summaries 
+from app.services.analytics_service import calculate_summary, compare_stock_summaries , compare_summaries 
 allowed_periods = [
     "1d",
     "5d",
@@ -176,3 +176,35 @@ def compare_stocks(
     except Exception as e:
       print("ACTUAL ERROR:", repr(e))
       raise
+
+@app.get("/compare-stocks")
+def compare_multiple_stocks(
+    symbols: list[str] = Query(...),
+    start: date = Query(...),
+    end: date = Query(...)
+):
+    if len(symbols) < 2 or len(symbols) > 5:
+        raise HTTPException(
+            status_code=400,
+            detail="Stock comparison requires between 2 and 5 stocks."
+        )
+
+    summaries = {}
+
+    for symbol in symbols:
+       data = download_stock_data(symbol, start=start, end=end)
+       if data.empty:
+         raise HTTPException(
+        status_code=404,
+        detail=f"No trading data available for {symbol}."
+    )
+       data = calculate_daily_returns(data)
+       summary = calculate_summary(data)
+
+       summaries[symbol] = summary 
+
+    comparison = compare_stock_summaries(summaries)
+    return {
+    "stocks": summaries,
+    "comparison": comparison
+}
