@@ -56,6 +56,25 @@ def calculate_summary(data):
     average_gain = gains.rolling(14).mean()
     average_loss = losses.rolling(14).mean()
 
+    valid_returns = data["Daily Return"].dropna()
+    if len(valid_returns) > 0 : 
+        up_days = (valid_returns[valid_returns > 0].sum())
+        down_days = (valid_returns[valid_returns < 0].sum())
+        unchanged_days = (valid_returns[valid_returns == 0].sum())
+
+        total_valid_days = len(valid_returns)
+        up_day_percent = (up_days / total_valid_days) * 100
+        down_day_percent = (down_days / total_valid_days) * 100
+        unchanged_day_percent = (unchanged_days / total_valid_days) * 100
+    else:
+       up_days = None
+       down_days = None 
+       unchanged_days = None
+
+       up_day_percent = None
+       down_day_percent = None
+       unchanged_day_percent = None
+
     rs = average_gain / average_loss
     rsi = 100 - (100 / (1 + rs))
 
@@ -358,7 +377,14 @@ def calculate_summary(data):
             bandwidth_interpretation
             if bandwidth_interpretation is not None
             else None
-        )
+        ),
+
+        "up_days": up_days,
+        "down_days": down_days,
+        "unchanged_days": unchanged_days,
+        "up_day_percent": up_day_percent,
+        "down_day_percent": down_day_percent,
+        "unchanged_day_percent": unchanged_day_percent,
     }
 
 def compare_summaries(summary_a, summary_b):
