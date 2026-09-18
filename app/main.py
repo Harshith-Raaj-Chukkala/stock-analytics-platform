@@ -1,5 +1,6 @@
 from fastapi import FastAPI , HTTPException , Query
 from app.services.stock_service import download_stock_data, calculate_daily_returns
+from app.services.portfolio_service import Portfolio, calculate_current_value, calculate_profit_loss, calculate_profit_loss_percentage, calculate_total_current_value, calculate_total_investment, calculate_total_profit_loss, calculate_total_profit_loss_percentage, calculate_transaction_cost
 
 import numpy as np
 from app.services.analytics_service import calculate_summary, compare_stock_summaries , compare_summaries 
@@ -208,3 +209,46 @@ def compare_multiple_stocks(
     "stocks": summaries,
     "comparison": comparison
 }
+
+@app.post("/portfolio")
+def calculate_portfolio(portfolio: Portfolio):
+     transaction_costs=[]
+
+     for transaction in portfolio.transactions:
+         cost = calculate_transaction_cost(transaction)
+         transaction_costs.append(cost)
+
+     total_invested = calculate_total_investment(portfolio)
+
+     current_values = []
+     for transaction in portfolio.transactions:
+         current_value = calculate_current_value(transaction)
+         current_values.append(current_value)
+
+     profit_losses = []
+     for transaction in portfolio.transactions:
+         profit_loss = calculate_profit_loss(transaction)
+         profit_losses.append(profit_loss)
+
+     profit_loss_percentages = []
+     for transaction in portfolio.transactions:
+        profit_loss_percentage = calculate_profit_loss_percentage(transaction)
+        profit_loss_percentages.append(profit_loss_percentage)
+
+     total_current_value = calculate_total_current_value(portfolio)
+
+     total_profit_loss = calculate_total_profit_loss(portfolio)
+
+     total_profit_loss_percentage = calculate_total_profit_loss_percentage(portfolio)
+
+     return {
+    "transaction_costs": [round(x, 2) for x in transaction_costs],
+    "total_invested": round(total_invested, 2),
+    "current_values": [round(x, 2) for x in current_values],
+    "profit_losses": [round(x, 2) for x in profit_losses],
+    "profit_loss_percentages": [round(x, 2) for x in profit_loss_percentages],
+    "total_current_value": round(total_current_value, 2),
+    "total_profit_loss": round(total_profit_loss, 2),
+    "total_profit_loss_percentage": round(total_profit_loss_percentage, 2)
+}
+
