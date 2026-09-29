@@ -23,21 +23,19 @@ def calculate_total_investment(portfolio: Portfolio):
        total += calculate_transaction_cost(transaction)
    return total
 
-def calculate_current_value(transaction): 
-    data = download_stock_data(transaction.symbol,period="1d")  
-
-    latest_price = data["Close"].iloc[-1] 
+def calculate_current_value(transaction: Transaction, current_prices):
+    latest_price = current_prices[transaction.symbol]
 
     return transaction.quantity * latest_price
 
-def calculate_profit_loss(transaction): 
-    current_value = calculate_current_value(transaction)
+def calculate_profit_loss(transaction: Transaction, current_prices):
+    current_value = calculate_current_value(transaction, current_prices)
     total_investment = calculate_transaction_cost(transaction)
 
     return current_value - total_investment
 
-def calculate_profit_loss_percentage(transaction):
-    profit_loss = calculate_profit_loss(transaction)
+def calculate_profit_loss_percentage(transaction: Transaction, current_prices):
+    profit_loss = calculate_profit_loss(transaction, current_prices)
     total_investment = calculate_transaction_cost(transaction)
 
     if total_investment == 0:
@@ -45,27 +43,61 @@ def calculate_profit_loss_percentage(transaction):
 
     return (profit_loss / total_investment) * 100
 
-def calculate_total_current_value(portfolio: Portfolio):
+def calculate_total_current_value(portfolio: Portfolio, current_prices):
     total_current_value = 0
 
     for transaction in portfolio.transactions:
-        total_current_value += calculate_current_value(transaction)
+        total_current_value += calculate_current_value(transaction, current_prices)
 
     return total_current_value
 
-def calculate_total_profit_loss(portfolio: Portfolio):
+def calculate_total_profit_loss(portfolio: Portfolio, current_prices):
     total_profit_loss = 0
 
     for transaction in portfolio.transactions:
-        total_profit_loss += calculate_profit_loss(transaction)
+        total_profit_loss += calculate_profit_loss(transaction, current_prices)
 
     return total_profit_loss
 
-def calculate_total_profit_loss_percentage(portfolio: Portfolio):
-    total_profit_loss = calculate_total_profit_loss(portfolio)
+def calculate_total_profit_loss_percentage(portfolio: Portfolio, current_prices):
+    total_profit_loss = calculate_total_profit_loss(portfolio, current_prices)
     total_investment = calculate_total_investment(portfolio)
 
     if total_investment == 0:
         return 0
 
     return (total_profit_loss / total_investment) * 100
+
+def calculate_initial_weight(transaction: Transaction, portfolio: Portfolio):
+    transaction_cost = calculate_transaction_cost(transaction)
+    total_investment = calculate_total_investment(portfolio)
+
+    return (transaction_cost / total_investment) * 100
+
+
+def calculate_current_weight(
+    transaction: Transaction,
+    portfolio: Portfolio,
+    current_prices
+):
+    current_value = calculate_current_value(transaction, current_prices)
+    total_current_value = calculate_total_current_value(
+        portfolio,
+        current_prices
+    )
+
+    return (current_value / total_current_value) * 100
+
+
+def calculate_contribution(
+    transaction: Transaction,
+    portfolio: Portfolio,
+    current_prices
+):
+    initial_weight = calculate_initial_weight(transaction, portfolio)
+    profit_loss_percentage = calculate_profit_loss_percentage(
+        transaction,
+        current_prices
+    )
+
+    return (initial_weight * profit_loss_percentage) / 100

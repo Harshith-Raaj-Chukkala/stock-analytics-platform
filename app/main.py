@@ -1,6 +1,6 @@
 from fastapi import FastAPI , HTTPException , Query
 from app.services.stock_service import download_stock_data, calculate_daily_returns
-from app.services.portfolio_service import Portfolio, calculate_current_value, calculate_profit_loss, calculate_profit_loss_percentage, calculate_total_current_value, calculate_total_investment, calculate_total_profit_loss, calculate_total_profit_loss_percentage, calculate_transaction_cost
+from app.services.portfolio_service import Portfolio, calculate_contribution, calculate_current_value, calculate_current_weight, calculate_initial_weight, calculate_profit_loss, calculate_profit_loss_percentage, calculate_total_current_value, calculate_total_investment, calculate_total_profit_loss, calculate_total_profit_loss_percentage, calculate_transaction_cost
 
 import numpy as np
 from app.services.analytics_service import calculate_summary, compare_stock_summaries , compare_summaries 
@@ -212,43 +212,104 @@ def compare_multiple_stocks(
 
 @app.post("/portfolio")
 def calculate_portfolio(portfolio: Portfolio):
-     transaction_costs=[]
 
-     for transaction in portfolio.transactions:
-         cost = calculate_transaction_cost(transaction)
-         transaction_costs.append(cost)
+    current_prices = {}
 
-     total_invested = calculate_total_investment(portfolio)
+    for transaction in portfolio.transactions:
+        if transaction.symbol not in current_prices:
+            data = download_stock_data(transaction.symbol, period="1d")
+            current_prices[transaction.symbol] = data["Close"].iloc[-1]
+    
 
-     current_values = []
-     for transaction in portfolio.transactions:
-         current_value = calculate_current_value(transaction)
-         current_values.append(current_value)
+    transaction_costs = []
 
-     profit_losses = []
-     for transaction in portfolio.transactions:
-         profit_loss = calculate_profit_loss(transaction)
-         profit_losses.append(profit_loss)
+    for transaction in portfolio.transactions:
+        cost = calculate_transaction_cost(transaction)
+        transaction_costs.append(cost)
 
-     profit_loss_percentages = []
-     for transaction in portfolio.transactions:
-        profit_loss_percentage = calculate_profit_loss_percentage(transaction)
+    total_invested = calculate_total_investment(portfolio)
+
+    current_values = []
+
+    for transaction in portfolio.transactions:
+        current_value = calculate_current_value(transaction, current_prices)
+        current_values.append(current_value)
+
+    profit_losses = []
+
+    for transaction in portfolio.transactions:
+        profit_loss = calculate_profit_loss(transaction, current_prices)
+        profit_losses.append(profit_loss)
+
+    profit_loss_percentages = []
+
+    for transaction in portfolio.transactions:
+        profit_loss_percentage = calculate_profit_loss_percentage(
+            transaction,
+            current_prices
+        )
         profit_loss_percentages.append(profit_loss_percentage)
 
-     total_current_value = calculate_total_current_value(portfolio)
+    initial_weights = []
 
-     total_profit_loss = calculate_total_profit_loss(portfolio)
+    for transaction in portfolio.transactions:
+        initial_weight = calculate_initial_weight(transaction, portfolio)
+        initial_weights.append(initial_weight)
 
-     total_profit_loss_percentage = calculate_total_profit_loss_percentage(portfolio)
+    current_weights = []
 
-     return {
-    "transaction_costs": [round(x, 2) for x in transaction_costs],
-    "total_invested": round(total_invested, 2),
-    "current_values": [round(x, 2) for x in current_values],
-    "profit_losses": [round(x, 2) for x in profit_losses],
-    "profit_loss_percentages": [round(x, 2) for x in profit_loss_percentages],
-    "total_current_value": round(total_current_value, 2),
-    "total_profit_loss": round(total_profit_loss, 2),
-    "total_profit_loss_percentage": round(total_profit_loss_percentage, 2)
-}
+    for transaction in portfolio.transactions:
+        current_weight = calculate_current_weight(
+            transaction,
+            portfolio,
+            current_prices
+        )
+        current_weights.append(current_weight)
+
+    contributions = {}
+
+    for transaction in portfolio.transactions:
+
+        contribution = calculate_contribution(
+            transaction,
+            portfolio,
+            current_prices
+        )
+
+        if transaction.symbol not in contributions:
+            contributions[transaction.symbol] = 0
+
+        contributions[transaction.symbol] += contribution
+
+    total_current_value = calculate_total_current_value(
+        portfolio,
+        current_prices
+    )
+
+    total_profit_loss = calculate_total_profit_loss(
+        portfolio,
+        current_prices
+    )
+
+    total_profit_loss_percentage = calculate_total_profit_loss_percentage(
+        portfolio,
+        current_prices
+    )
+
+    return {
+        "transaction_costs": [round(x, 2) for x in transaction_costs],
+        "total_invested": round(total_invested, 2),
+        "current_values": [round(x, 2) for x in current_values],
+        "profit_losses": [round(x, 2) for x in profit_losses],
+        "profit_loss_percentages": [round(x, 2) for x in profit_loss_percentages],
+        "total_current_value": round(total_current_value, 2),
+        "total_profit_loss": round(total_profit_loss, 2),
+        "total_profit_loss_percentage": round(total_profit_loss_percentage, 2),
+        "initial_weights": [round(x, 2) for x in initial_weights],
+        "current_weights": [round(x, 2) for x in current_weights],
+        "contributions": {
+            symbol: round(value, 2)
+            for symbol, value in contributions.items()
+        },
+    }
 
