@@ -58,9 +58,9 @@ def calculate_summary(data):
 
     valid_returns = data["Daily Return"].dropna()
     if len(valid_returns) > 0 : 
-        up_days = (valid_returns[valid_returns > 0].sum())
-        down_days = (valid_returns[valid_returns < 0].sum())
-        unchanged_days = (valid_returns[valid_returns == 0].sum())
+        up_days = int((valid_returns > 0).sum())
+        down_days = int((valid_returns < 0).sum())
+        unchanged_days = int((valid_returns == 0).sum())
 
         total_valid_days = len(valid_returns)
         up_day_percent = (up_days / total_valid_days) * 100

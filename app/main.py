@@ -1,6 +1,7 @@
 from fastapi import FastAPI , HTTPException , Query
 from app.services.stock_service import download_stock_data, calculate_daily_returns
 from app.services.portfolio_service import Portfolio, calculate_contribution, calculate_current_value, calculate_current_weight, calculate_initial_weight, calculate_profit_loss, calculate_profit_loss_percentage, calculate_total_current_value, calculate_total_investment, calculate_total_profit_loss, calculate_total_profit_loss_percentage, calculate_transaction_cost
+from fastapi.staticfiles import StaticFiles
 
 import numpy as np
 from app.services.analytics_service import calculate_summary, compare_stock_summaries , compare_summaries 
@@ -17,6 +18,7 @@ allowed_periods = [
     "max"
 ]
 app = FastAPI()
+app.mount("/ui", StaticFiles(directory="prototype_ui", html=True), name="prototype_ui")
 
 @app.get("/stock")
 def get_stock(
@@ -77,7 +79,7 @@ def get_stock(
         summary = calculate_summary(data)
         
         data = data.replace({np.nan: None})
-        history = data.to_dict(orient="records")
+        history = data.reset_index().to_dict(orient="records")
 
         return {
     "stock": {

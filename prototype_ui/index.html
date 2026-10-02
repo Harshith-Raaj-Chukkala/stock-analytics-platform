@@ -1,0 +1,380 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+
+    <title>Stock Analytics</title>
+
+    <script src="https://cdn.plot.ly/plotly-2.35.2.min.js"></script>
+
+    <style>
+        body {
+            font-family: Arial, sans-serif;
+            max-width: 1100px;
+            margin: 30px auto;
+            padding: 0 20px;
+        }
+
+        h1 {
+            margin-bottom: 20px;
+        }
+
+        .controls {
+            display: flex;
+            gap: 8px;
+            align-items: center;
+            margin-bottom: 12px;
+        }
+
+        input,
+        select,
+        button {
+            padding: 7px 9px;
+            font-size: 14px;
+        }
+
+        button {
+            cursor: pointer;
+        }
+
+        #status {
+            margin: 12px 0 4px;
+        }
+
+        #as-of {
+            margin-bottom: 20px;
+            color: #666;
+            font-size: 14px;
+        }
+
+        .chart {
+            width: 100%;
+            margin-bottom: 40px;
+        }
+
+        .error {
+            color: #b00020;
+        }
+    </style>
+</head>
+
+<body>
+
+    <h1>Stock Analytics</h1>
+
+    <div class="controls">
+        <input
+            id="symbol"
+            type="text"
+            value="RELIANCE.NS"
+            placeholder="Enter symbol"
+        >
+
+        <select id="period">
+            <option value="1mo">1 Month</option>
+            <option value="3mo">3 Months</option>
+            <option value="6mo">6 Months</option>
+            <option value="1y">1 Year</option>
+            <option value="2y">2 Years</option>
+            <option value="5y">5 Years</option>
+        </select>
+
+        <button id="load-button">Load</button>
+    </div>
+
+    <div id="status"></div>
+    <div id="as-of"></div>
+
+    <div id="price-chart" class="chart"></div>
+    <div id="volume-chart" class="chart"></div>
+    <div id="returns-chart" class="chart"></div>
+
+
+    <script>
+        const symbolInput = document.getElementById("symbol");
+        const periodSelect = document.getElementById("period");
+        const loadButton = document.getElementById("load-button");
+
+        const status = document.getElementById("status");
+        const asOf = document.getElementById("as-of");
+
+        const chartIds = [
+            "price-chart",
+            "volume-chart",
+            "returns-chart"
+        ];
+
+        const chartMargins = {
+            l: 70,
+            r: 30,
+            t: 80,
+            b: 60
+        };
+
+        const weekendBreaks = [
+            { bounds: ["sat", "mon"] }
+        ];
+
+
+        function clearCharts() {
+            chartIds.forEach(id => {
+                Plotly.purge(id);
+                document.getElementById(id).innerHTML = "";
+            });
+
+            asOf.textContent = "";
+        }
+
+
+        function setStatus(message, isError = false) {
+            status.textContent = message;
+            status.className = isError ? "error" : "";
+        }
+
+
+        function getSelectedRequest() {
+            const symbol = symbolInput.value.trim().toUpperCase();
+            const period = periodSelect.value;
+
+            return { symbol, period };
+        }
+
+
+        function formatAsOfDate(dateString) {
+            const date = new Date(dateString);
+
+            if (Number.isNaN(date.getTime())) {
+                return dateString;
+            }
+
+            return date.toLocaleDateString("en-IN", {
+                day: "numeric",
+                month: "short",
+                year: "numeric"
+            });
+        }
+
+
+        async function loadStock() {
+
+            const { symbol, period } = getSelectedRequest();
+
+            if (!symbol) {
+                clearCharts();
+                setStatus("Please enter a stock symbol.", true);
+                return;
+            }
+
+            clearCharts();
+
+            setStatus(`Loading ${symbol} - ${period}...`);
+            loadButton.disabled = true;
+
+            try {
+                const response = await fetch(
+                    `/stock?symbol=${encodeURIComponent(symbol)}&period=${period}`
+                );
+
+                if (!response.ok) {
+                    let errorMessage = `Unable to load ${symbol}.`;
+
+                    try {
+                        const errorData = await response.json();
+
+                        if (errorData.detail) {
+                            errorMessage = errorData.detail;
+                        }
+                    } catch {
+                        // Keep the default error message.
+                    }
+
+                    throw new Error(errorMessage);
+                }
+
+                const data = await response.json();
+                const history = data.history;
+
+                if (!history || history.length === 0) {
+                    throw new Error(`No trading data available for ${symbol}.`);
+                }
+
+
+                // -------------------------
+                // Extract chart data
+                // -------------------------
+
+                const dates = history.map(row => row.Date);
+                const closePrices = history.map(row => row.Close);
+                const movingAverage = history.map(
+                    row => row["Moving Average 20"]
+                );
+                const volumes = history.map(row => row.Volume);
+                const dailyReturns = history.map(
+                    row => row["Daily Return"]
+                );
+
+
+                // -------------------------
+                // Data as of
+                // -------------------------
+
+                const lastDate = history[history.length - 1].Date;
+
+                asOf.textContent =
+                    `Data as of: ${formatAsOfDate(lastDate)}`;
+
+
+                // -------------------------
+                // Common chart layout
+                // -------------------------
+
+                const commonLayout = {
+                    autosize: true,
+                    margin: chartMargins,
+                    hovermode: "x unified",
+                    xaxis: {
+                        title: "Date",
+                        rangebreaks: weekendBreaks
+                    }
+                };
+
+
+                // -------------------------
+                // Price chart
+                // -------------------------
+
+                Plotly.newPlot(
+                    "price-chart",
+                    [
+                        {
+                            x: dates,
+                            y: closePrices,
+                            type: "scatter",
+                            mode: "lines",
+                            name: "Close (unadjusted)"
+                        },
+                        {
+                            x: dates,
+                            y: movingAverage,
+                            type: "scatter",
+                            mode: "lines",
+                            name: "Moving Average 20"
+                        }
+                    ],
+                    {
+                        ...commonLayout,
+                        title: `${symbol} - Price`,
+                        yaxis: {
+                            title: "Price (₹)"
+                        },
+                        legend: {
+                            orientation: "h",
+                            x: 0,
+                            y: 1.15
+                        }
+                    },
+                    {
+                        responsive: true
+                    }
+                );
+
+
+                // -------------------------
+                // Volume chart
+                // -------------------------
+
+                Plotly.newPlot(
+                    "volume-chart",
+                    [
+                        {
+                            x: dates,
+                            y: volumes,
+                            type: "bar",
+                            name: "Volume"
+                        }
+                    ],
+                    {
+                        ...commonLayout,
+                        title: `${symbol} - Trading Volume`,
+                        yaxis: {
+                            title: "Volume"
+                        },
+                        showlegend: false
+                    },
+                    {
+                        responsive: true
+                    }
+                );
+
+
+                // -------------------------
+                // Daily returns chart
+                // -------------------------
+
+                Plotly.newPlot(
+                    "returns-chart",
+                    [
+                        {
+                            x: dates,
+                            y: dailyReturns,
+                            type: "bar",
+                            name: "Daily Return"
+                        }
+                    ],
+                    {
+                        ...commonLayout,
+                        title: `${symbol} - Daily Returns`,
+                        yaxis: {
+                            title: "Daily Return (%)"
+                        },
+                        showlegend: false
+                    },
+                    {
+                        responsive: true
+                    }
+                );
+
+
+                setStatus(`Loaded ${symbol} - ${period}`);
+
+            } catch (error) {
+
+                clearCharts();
+
+                setStatus(
+                    `Error: ${error.message}`,
+                    true
+                );
+
+            } finally {
+                loadButton.disabled = false;
+            }
+        }
+
+
+        loadButton.addEventListener("click", loadStock);
+
+
+        periodSelect.addEventListener("change", () => {
+            const { symbol, period } = getSelectedRequest();
+
+            setStatus(`Ready to load ${symbol} - ${period}`);
+        });
+
+
+        symbolInput.addEventListener("input", () => {
+            const { symbol, period } = getSelectedRequest();
+
+            if (symbol) {
+                setStatus(`Ready to load ${symbol} - ${period}`);
+            }
+        });
+
+
+        // Initial load
+        loadStock();
+    </script>
+
+</body>
+</html>
