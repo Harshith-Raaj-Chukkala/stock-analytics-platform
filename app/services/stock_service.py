@@ -1,10 +1,15 @@
 import logging
 import os
+from pathlib import Path
 import boto3
 import pandas as pd
 import yfinance as yf
 from dotenv import load_dotenv
 from app.services.data_validator import validate_and_normalize_stock_data
+from app.services.market_data_repository import (
+    DEFAULT_DB_PATH,
+    MarketDataRepository,
+)
 
 
 load_dotenv()
@@ -18,6 +23,19 @@ S3_SYNC_ENABLED = os.getenv("S3_SYNC_ENABLED", "false").strip().lower() in (
     "1",
     "yes",
 )
+DB_PATH = os.getenv("MARKET_DATA_DB_PATH", str(DEFAULT_DB_PATH))
+
+_repository: MarketDataRepository | None = None
+_repository_path: Path | None = None
+
+
+def _get_repository() -> MarketDataRepository:
+    global _repository, _repository_path
+    target_path = Path(DB_PATH).resolve()
+    if _repository is None or _repository_path != target_path:
+        _repository = MarketDataRepository(db_path=target_path)
+        _repository_path = target_path
+    return _repository
 
 
 def download_stock_data(symbol, period="1mo", start=None, end=None):
@@ -32,6 +50,16 @@ def download_stock_data(symbol, period="1mo", start=None, end=None):
 
  if data.empty: 
      return data
+
+ mark_full_history = (not (start and end)) and (
+     isinstance(period, str) and period.strip().lower() == "max"
+ )
+ repo = _get_repository()
+ repo.upsert_stock_data(
+     symbol=symbol,
+     df=data,
+     mark_full_history=mark_full_history,
+ )
  
  os.makedirs("data", exist_ok=True)
  filename = f"data/{symbol}.csv"

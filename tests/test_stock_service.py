@@ -8,7 +8,9 @@ from app.services.data_validator import (
     CANONICAL_COLUMNS,
     validate_and_normalize_stock_data,
 )
+from app.services.market_data_repository import MarketDataRepository
 from app.services.stock_service import (
+    _get_repository,
     calculate_daily_returns,
     download_stock_data,
 )
@@ -258,3 +260,182 @@ def test_calculate_daily_returns_on_canonical_dataframe():
     assert np.isnan(out["Daily Return"].iloc[0])
     assert out["Daily Return"].iloc[1] == pytest.approx(10.0)
     assert out["Daily Return"].iloc[2] == pytest.approx(-10.0)
+
+
+def test_download_stock_data_persists_validated_data_and_metadata_in_sqlite(
+    monkeypatch, tmp_path
+):
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setattr(stock_service, "S3_SYNC_ENABLED", False)
+
+    raw_df = pd.DataFrame(
+        {
+            "Open": [100.0, 102.0, -10.0, 105.0],
+            "High": [105.0, 108.0, 105.0, 110.0],
+            "Low": [98.0, 101.0, 95.0, 104.0],
+            "Close": [103.0, 106.0, -5.0, 109.0],
+            "Volume": [1000, 1500, 1200, 2500],
+        },
+        index=pd.DatetimeIndex(
+            [
+                "2025-01-01 00:00:00+05:30",
+                "2025-01-02 00:00:00+05:30",
+                "2025-01-03 00:00:00+05:30",  # invalid row -> dropped
+                "2025-01-06 00:00:00+05:30",
+            ],
+            name="Date",
+        ),
+    )
+
+    monkeypatch.setattr(
+        stock_service.yf,
+        "Ticker",
+        lambda symbol: FakeTicker(raw_df, []),
+    )
+
+    returned_df = download_stock_data("RELIANCE.NS", period="1mo")
+
+    db_file = tmp_path / "data" / "market_data.db"
+    assert db_file.exists()
+
+    repo = MarketDataRepository(db_path=db_file)
+    stored_df = repo.get_stock_data("RELIANCE.NS")
+    pd.testing.assert_frame_equal(stored_df, returned_df)
+
+    meta = repo.get_metadata("RELIANCE.NS")
+    assert meta is not None
+    assert meta.symbol == "RELIANCE.NS"
+    assert meta.min_date == "2025-01-01"
+    assert meta.max_date == "2025-01-06"
+    assert meta.row_count == 3
+    assert meta.has_full_history is False
+
+
+def test_download_stock_data_accumulates_sqlite_history_across_partial_fetches(
+    monkeypatch, tmp_path
+):
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setattr(stock_service, "S3_SYNC_ENABLED", False)
+
+    # First call: full history fetch (period="max") with 3 trading days
+    history_batch = pd.DataFrame(
+        {
+            "Open": [100.0, 105.0, 110.0],
+            "High": [106.0, 112.0, 115.0],
+            "Low": [99.0, 104.0, 108.0],
+            "Close": [105.0, 110.0, 112.0],
+            "Volume": [1000, 1200, 1400],
+        },
+        index=pd.DatetimeIndex(["2025-01-01", "2025-01-02", "2025-01-03"], name="Date"),
+    )
+    monkeypatch.setattr(
+        stock_service.yf,
+        "Ticker",
+        lambda symbol: FakeTicker(history_batch, []),
+    )
+    _ = download_stock_data("INFY.NS", period="max")
+
+    # Second call: 1-day fetch (e.g. POST /portfolio) updating 2025-01-03 and adding 2025-01-06
+    short_batch = pd.DataFrame(
+        {
+            "Open": [110.0, 114.0],
+            "High": [116.0, 120.0],
+            "Low": [109.0, 113.0],
+            "Close": [114.0, 118.0],
+            "Volume": [1600, 2000],
+        },
+        index=pd.DatetimeIndex(["2025-01-03", "2025-01-06"], name="Date"),
+    )
+    monkeypatch.setattr(
+        stock_service.yf,
+        "Ticker",
+        lambda symbol: FakeTicker(short_batch, []),
+    )
+    short_return = download_stock_data("INFY.NS", period="1d")
+    assert len(short_return) == 2
+
+    # SQLite retains all 4 historical dates without truncation and keeps has_full_history=True
+    repo = _get_repository()
+    stored_all = repo.get_stock_data("INFY.NS")
+    assert len(stored_all) == 4
+    assert list(stored_all.index) == [
+        pd.Timestamp("2025-01-01"),
+        pd.Timestamp("2025-01-02"),
+        pd.Timestamp("2025-01-03"),
+        pd.Timestamp("2025-01-06"),
+    ]
+    assert stored_all.loc[pd.Timestamp("2025-01-03"), "Close"] == 114.0
+    assert stored_all.loc[pd.Timestamp("2025-01-06"), "Close"] == 118.0
+
+    meta = repo.get_metadata("INFY.NS")
+    assert meta is not None
+    assert meta.min_date == "2025-01-01"
+    assert meta.max_date == "2025-01-06"
+    assert meta.row_count == 4
+    assert meta.has_full_history is True
+
+
+def test_download_stock_data_empty_or_invalid_does_not_persist_or_corrupt_sqlite(
+    monkeypatch, tmp_path
+):
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setattr(stock_service, "S3_SYNC_ENABLED", False)
+
+    # Empty fetch for unknown symbol does not create a DB file or metadata
+    monkeypatch.setattr(
+        stock_service.yf,
+        "Ticker",
+        lambda symbol: FakeTicker(pd.DataFrame(), []),
+    )
+    _ = download_stock_data("EMPTY.NS", period="1mo")
+    assert not (tmp_path / "data" / "market_data.db").exists()
+
+    # Seed valid data for TCS.NS, then simulate an all-invalid fetch for TCS.NS
+    valid_batch = pd.DataFrame(
+        {
+            "Open": [100.0],
+            "High": [105.0],
+            "Low": [99.0],
+            "Close": [102.0],
+            "Volume": [1000],
+        },
+        index=pd.DatetimeIndex(["2025-01-01"], name="Date"),
+    )
+    monkeypatch.setattr(
+        stock_service.yf,
+        "Ticker",
+        lambda symbol: FakeTicker(valid_batch, []),
+    )
+    _ = download_stock_data("TCS.NS", period="1mo")
+    repo = _get_repository()
+    meta_before = repo.get_metadata("TCS.NS")
+
+    invalid_batch = pd.DataFrame(
+        {
+            "Open": [-10.0],
+            "High": [5.0],
+            "Low": [10.0],
+            "Close": [-5.0],
+            "Volume": [-100],
+        },
+        index=pd.DatetimeIndex(["2025-01-02"], name="Date"),
+    )
+    monkeypatch.setattr(
+        stock_service.yf,
+        "Ticker",
+        lambda symbol: FakeTicker(invalid_batch, []),
+    )
+    res_invalid = download_stock_data("TCS.NS", period="1mo")
+    assert res_invalid.empty
+
+    # Existing SQLite data and metadata for TCS.NS remain intact
+    assert len(repo.get_stock_data("TCS.NS")) == 1
+    assert repo.get_metadata("TCS.NS") == meta_before
+
+
+def test_get_repository_reuses_instance_for_same_db_path(monkeypatch, tmp_path):
+    monkeypatch.chdir(tmp_path)
+    repo1 = _get_repository()
+    repo2 = _get_repository()
+    assert repo1 is repo2
+
