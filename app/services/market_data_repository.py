@@ -1,0 +1,428 @@
+from contextlib import contextmanager
+from dataclasses import dataclass
+from datetime import date, datetime, timezone
+from pathlib import Path
+import sqlite3
+import numpy as np
+import pandas as pd
+
+from app.services.data_validator import (
+    CANONICAL_COLUMNS,
+    OHLC_TOLERANCE,
+    REQUIRED_OHLCV_COLUMNS,
+    _empty_canonical_df,
+)
+
+DEFAULT_DB_PATH = Path("data/market_data.db")
+
+
+@dataclass(frozen=True)
+class SymbolMetadata:
+    """
+    Per-symbol ingestion state stored in SQLite.
+
+    Representations:
+    - symbol: Uppercase ticker symbol (e.g. "RELIANCE.NS").
+    - min_date: Earliest stored trading date as ISO "YYYY-MM-DD".
+    - max_date: Latest stored trading date as ISO "YYYY-MM-DD".
+    - last_synced_at: ISO-8601 UTC timestamp string (e.g. "2025-01-15T10:30:00+00:00").
+    - has_full_history: True if full available history has ever been marked for this symbol.
+    - row_count: Total number of stored daily bars for this symbol.
+    """
+
+    symbol: str
+    min_date: str
+    max_date: str
+    last_synced_at: str
+    has_full_history: bool
+    row_count: int
+
+
+def _normalize_symbol(symbol: str) -> str:
+    if not isinstance(symbol, str) or not symbol.strip():
+        raise ValueError("Symbol must be a non-empty string.")
+    return symbol.strip().upper()
+
+
+def _normalize_query_date(value: date | datetime | pd.Timestamp | str | None, name: str) -> str | None:
+    if value is None:
+        return None
+    if isinstance(value, pd.Timestamp):
+        if pd.isna(value):
+            raise ValueError(f"{name} cannot be NaT.")
+        return value.strftime("%Y-%m-%d")
+    if isinstance(value, datetime):
+        return value.date().isoformat()
+    if isinstance(value, date):
+        return value.isoformat()
+    if isinstance(value, str):
+        stripped = value.strip()
+        if not stripped:
+            raise ValueError(f"{name} cannot be an empty string.")
+        try:
+            return date.fromisoformat(stripped).isoformat()
+        except ValueError as exc:
+            raise ValueError(f"Invalid ISO date for {name}: {value!r}") from exc
+    raise ValueError(f"Unsupported date type for {name}: {type(value).__name__}")
+
+
+def _normalize_synced_at(synced_at: datetime | str | None) -> str:
+    if synced_at is None:
+        return datetime.now(timezone.utc).isoformat()
+    if isinstance(synced_at, datetime):
+        if synced_at.tzinfo is None:
+            return synced_at.replace(tzinfo=timezone.utc).isoformat()
+        return synced_at.astimezone(timezone.utc).isoformat()
+    if isinstance(synced_at, str):
+        stripped = synced_at.strip()
+        if not stripped:
+            raise ValueError("synced_at cannot be an empty string.")
+        try:
+            parsed = datetime.fromisoformat(stripped)
+        except ValueError as exc:
+            raise ValueError(f"Invalid ISO timestamp for synced_at: {synced_at!r}") from exc
+        if parsed.tzinfo is None:
+            parsed = parsed.replace(tzinfo=timezone.utc)
+        else:
+            parsed = parsed.astimezone(timezone.utc)
+        return parsed.isoformat()
+    raise ValueError(f"Unsupported synced_at type: {type(synced_at).__name__}")
+
+
+def _verify_canonical_dataframe(df: pd.DataFrame) -> None:
+    """
+    Verify that a non-empty DataFrame adheres to the canonical contract before writing.
+    Raises ValueError if the structure or values would corrupt stored data.
+    """
+    if not isinstance(df, pd.DataFrame):
+        raise ValueError("df must be a pandas DataFrame.")
+
+    if isinstance(df.columns, pd.MultiIndex):
+        raise ValueError("MultiIndex columns are not supported.")
+
+    if df.empty:
+        if len(df.columns) > 0:
+            missing = [col for col in REQUIRED_OHLCV_COLUMNS if col not in df.columns]
+            if missing:
+                raise ValueError(f"Missing required OHLCV columns: {missing}")
+        return
+
+    missing = [col for col in CANONICAL_COLUMNS if col not in df.columns]
+    if missing:
+        raise ValueError(f"DataFrame is missing canonical columns: {missing}")
+
+    if not isinstance(df.index, pd.DatetimeIndex):
+        raise ValueError("DataFrame index must be a pandas DatetimeIndex.")
+    if df.index.tz is not None:
+        raise ValueError("DataFrame DatetimeIndex must be timezone-naive.")
+    if df.index.isna().any():
+        raise ValueError("DataFrame index contains NaT values.")
+
+    normalized_dates = df.index.normalize()
+    if normalized_dates.duplicated().any():
+        raise ValueError(
+            "DataFrame index contains multiple timestamps for the same calendar date."
+        )
+    if (df.index != normalized_dates).any():
+        raise ValueError(
+            "DataFrame DatetimeIndex must be normalized to midnight (00:00:00)."
+        )
+
+    for col in ("Open", "High", "Low", "Close"):
+        series = df[col]
+        if not pd.api.types.is_numeric_dtype(series):
+            raise ValueError(f"Column {col} must be numeric.")
+        if series.isna().any() or not np.isfinite(series).all() or (series <= 0).any():
+            raise ValueError(f"Column {col} contains null, non-finite, or non-positive values.")
+
+    vol = df["Volume"]
+    if not pd.api.types.is_numeric_dtype(vol):
+        raise ValueError("Column Volume must be numeric.")
+    if vol.isna().any() or not np.isfinite(vol).all() or (vol < 0).any() or (np.floor(vol) != vol).any():
+        raise ValueError("Column Volume contains null, negative, or fractional values.")
+
+    for col in ("Dividends", "Stock Splits"):
+        series = df[col]
+        if not pd.api.types.is_numeric_dtype(series):
+            raise ValueError(f"Column {col} must be numeric.")
+        if series.isna().any() or not np.isfinite(series).all() or (series < 0).any():
+            raise ValueError(f"Column {col} contains null, non-finite, or negative values.")
+
+    oc_max = df[["Open", "Close"]].max(axis=1)
+    oc_min = df[["Open", "Close"]].min(axis=1)
+    if (
+        (df["High"] < df["Low"] - OHLC_TOLERANCE).any()
+        | (df["High"] < oc_max - OHLC_TOLERANCE).any()
+        | (df["Low"] > oc_min + OHLC_TOLERANCE).any()
+    ):
+        raise ValueError("DataFrame contains rows violating the OHLC price envelope.")
+
+
+def _rows_to_canonical_df(rows: list[tuple]) -> pd.DataFrame:
+    if not rows:
+        return _empty_canonical_df()
+
+    records = np.array(rows, dtype=object)
+    dates = pd.DatetimeIndex(
+        pd.to_datetime(records[:, 0], format="%Y-%m-%d"), name="Date"
+    ).normalize()
+    dates.name = "Date"
+
+    df = pd.DataFrame(
+        {
+            "Open": records[:, 1].astype("float64"),
+            "High": records[:, 2].astype("float64"),
+            "Low": records[:, 3].astype("float64"),
+            "Close": records[:, 4].astype("float64"),
+            "Volume": records[:, 5].astype("int64"),
+            "Dividends": records[:, 6].astype("float64"),
+            "Stock Splits": records[:, 7].astype("float64"),
+        },
+        index=dates,
+    )
+    return df[list(CANONICAL_COLUMNS)]
+
+
+class MarketDataRepository:
+    """
+    SQLite repository for canonical daily stock OHLCV bars and symbol-level sync metadata.
+    """
+
+    def __init__(self, db_path: str | Path = DEFAULT_DB_PATH):
+        self.db_path = Path(db_path)
+        self.db_path.parent.mkdir(parents=True, exist_ok=True)
+        self._initialize_schema()
+
+    @contextmanager
+    def _connect(self):
+        conn = sqlite3.connect(self.db_path)
+        try:
+            with conn:
+                yield conn
+        finally:
+            conn.close()
+
+    def _initialize_schema(self) -> None:
+        with self._connect() as conn:
+            conn.execute("PRAGMA journal_mode=WAL;")
+            conn.execute(
+                """
+                CREATE TABLE IF NOT EXISTS daily_prices (
+                    symbol TEXT NOT NULL,
+                    trade_date TEXT NOT NULL,
+                    open REAL NOT NULL,
+                    high REAL NOT NULL,
+                    low REAL NOT NULL,
+                    close REAL NOT NULL,
+                    volume INTEGER NOT NULL,
+                    dividends REAL NOT NULL,
+                    stock_splits REAL NOT NULL,
+                    PRIMARY KEY (symbol, trade_date)
+                );
+                """
+            )
+            conn.execute(
+                """
+                CREATE TABLE IF NOT EXISTS ingestion_metadata (
+                    symbol TEXT PRIMARY KEY,
+                    min_date TEXT NOT NULL,
+                    max_date TEXT NOT NULL,
+                    last_synced_at TEXT NOT NULL,
+                    has_full_history INTEGER NOT NULL DEFAULT 0,
+                    row_count INTEGER NOT NULL DEFAULT 0
+                );
+                """
+            )
+
+    def upsert_stock_data(
+        self,
+        symbol: str,
+        df: pd.DataFrame,
+        mark_full_history: bool = False,
+        synced_at: datetime | str | None = None,
+    ) -> int:
+        """
+        Atomically upsert canonical daily OHLCV rows and recalculate ingestion metadata.
+
+        Empty DataFrame behavior:
+        - If `df` is empty, no rows in `daily_prices` are deleted or modified.
+        - If metadata already exists for `symbol`, `last_synced_at` (and `has_full_history`
+          if `mark_full_history=True`) is updated while preserving `min_date`, `max_date`,
+          and `row_count`.
+        - If no rows exist yet for `symbol`, no metadata record is created.
+        - Returns the number of price rows upserted (`0` for an empty DataFrame).
+        """
+        norm_symbol = _normalize_symbol(symbol)
+        _verify_canonical_dataframe(df)
+        norm_synced_at = _normalize_synced_at(synced_at)
+        full_history_flag = 1 if bool(mark_full_history) else 0
+
+        if df.empty:
+            with self._connect() as conn:
+                conn.execute(
+                    """
+                    UPDATE ingestion_metadata
+                    SET last_synced_at = ?,
+                        has_full_history = MAX(has_full_history, ?)
+                    WHERE symbol = ?;
+                    """,
+                    (norm_synced_at, full_history_flag, norm_symbol),
+                )
+            return 0
+
+        working = df[list(CANONICAL_COLUMNS)].copy()
+        working = working.sort_index(kind="mergesort")
+
+        records = [
+            (
+                norm_symbol,
+                ts.strftime("%Y-%m-%d"),
+                float(row["Open"]),
+                float(row["High"]),
+                float(row["Low"]),
+                float(row["Close"]),
+                int(row["Volume"]),
+                float(row["Dividends"]),
+                float(row["Stock Splits"]),
+            )
+            for ts, row in working.iterrows()
+        ]
+
+        with self._connect() as conn:
+            conn.executemany(
+                """
+                INSERT INTO daily_prices (
+                    symbol, trade_date, open, high, low, close, volume, dividends, stock_splits
+                )
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                ON CONFLICT(symbol, trade_date) DO UPDATE SET
+                    open = excluded.open,
+                    high = excluded.high,
+                    low = excluded.low,
+                    close = excluded.close,
+                    volume = excluded.volume,
+                    dividends = excluded.dividends,
+                    stock_splits = excluded.stock_splits;
+                """,
+                records,
+            )
+
+            stats_row = conn.execute(
+                """
+                SELECT MIN(trade_date), MAX(trade_date), COUNT(*)
+                FROM daily_prices
+                WHERE symbol = ?;
+                """,
+                (norm_symbol,),
+            ).fetchone()
+
+            min_date, max_date, row_count = stats_row
+
+            conn.execute(
+                """
+                INSERT INTO ingestion_metadata (
+                    symbol, min_date, max_date, last_synced_at, has_full_history, row_count
+                )
+                VALUES (?, ?, ?, ?, ?, ?)
+                ON CONFLICT(symbol) DO UPDATE SET
+                    min_date = excluded.min_date,
+                    max_date = excluded.max_date,
+                    last_synced_at = excluded.last_synced_at,
+                    has_full_history = MAX(ingestion_metadata.has_full_history, excluded.has_full_history),
+                    row_count = excluded.row_count;
+                """,
+                (
+                    norm_symbol,
+                    min_date,
+                    max_date,
+                    norm_synced_at,
+                    full_history_flag,
+                    int(row_count),
+                ),
+            )
+
+        return len(records)
+
+    def get_stock_data(
+        self,
+        symbol: str,
+        start: date | datetime | pd.Timestamp | str | None = None,
+        end: date | datetime | pd.Timestamp | str | None = None,
+    ) -> pd.DataFrame:
+        """
+        Retrieve canonical OHLCV bars for `symbol`, optionally filtered by inclusive [start, end] dates.
+        """
+        norm_symbol = _normalize_symbol(symbol)
+        start_str = _normalize_query_date(start, "start")
+        end_str = _normalize_query_date(end, "end")
+
+        if start_str is not None and end_str is not None and start_str > end_str:
+            raise ValueError("start date must be before or equal to end date.")
+
+        query = """
+            SELECT trade_date, open, high, low, close, volume, dividends, stock_splits
+            FROM daily_prices
+            WHERE symbol = ?
+        """
+        params: list[str] = [norm_symbol]
+
+        if start_str is not None:
+            query += " AND trade_date >= ?"
+            params.append(start_str)
+        if end_str is not None:
+            query += " AND trade_date <= ?"
+            params.append(end_str)
+
+        query += " ORDER BY trade_date ASC;"
+
+        with self._connect() as conn:
+            rows = conn.execute(query, params).fetchall()
+
+        return _rows_to_canonical_df(rows)
+
+    def get_metadata(self, symbol: str) -> SymbolMetadata | None:
+        """
+        Retrieve ingestion metadata for `symbol`, or None if no metadata exists.
+        """
+        norm_symbol = _normalize_symbol(symbol)
+        with self._connect() as conn:
+            row = conn.execute(
+                """
+                SELECT symbol, min_date, max_date, last_synced_at, has_full_history, row_count
+                FROM ingestion_metadata
+                WHERE symbol = ?;
+                """,
+                (norm_symbol,),
+            ).fetchone()
+
+        if row is None:
+            return None
+
+        return SymbolMetadata(
+            symbol=row[0],
+            min_date=row[1],
+            max_date=row[2],
+            last_synced_at=row[3],
+            has_full_history=bool(row[4]),
+            row_count=int(row[5]),
+        )
+
+    def get_latest_row(self, symbol: str) -> pd.DataFrame:
+        """
+        Retrieve the single most recent daily bar for `symbol` as a 1-row canonical DataFrame,
+        or an empty canonical DataFrame if no data exists.
+        """
+        norm_symbol = _normalize_symbol(symbol)
+        with self._connect() as conn:
+            rows = conn.execute(
+                """
+                SELECT trade_date, open, high, low, close, volume, dividends, stock_splits
+                FROM daily_prices
+                WHERE symbol = ?
+                ORDER BY trade_date DESC
+                LIMIT 1;
+                """,
+                (norm_symbol,),
+            ).fetchall()
+
+        return _rows_to_canonical_df(rows)
