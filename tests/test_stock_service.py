@@ -1,4 +1,5 @@
 import logging
+from datetime import date
 import numpy as np
 import pandas as pd
 import pytest
@@ -113,9 +114,9 @@ def test_download_stock_data_forwards_period_vs_start_end_arguments(
     _ = download_stock_data("TCS.NS", period="6mo")
     assert history_calls[-1] == {"period": "6mo"}
 
-    # 2. Custom start/end path
+    # 2. Custom start/end path (exclusive next calendar day sent to yfinance)
     _ = download_stock_data("TCS.NS", start="2025-01-01", end="2025-01-31")
-    assert history_calls[-1] == {"start": "2025-01-01", "end": "2025-01-31"}
+    assert history_calls[-1] == {"start": "2025-01-01", "end": "2025-02-01"}
 
 
 def test_download_stock_data_empty_or_all_invalid_skips_csv_and_s3(
@@ -438,4 +439,550 @@ def test_get_repository_reuses_instance_for_same_db_path(monkeypatch, tmp_path):
     repo1 = _get_repository()
     repo2 = _get_repository()
     assert repo1 is repo2
+
+
+def test_explicit_date_range_cache_hit_skips_yfinance_and_filters_canonical_data(
+    monkeypatch, tmp_path
+):
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setattr(stock_service, "S3_SYNC_ENABLED", False)
+
+    # Seed SQLite via initial fetch covering 2025-01-01 through 2025-01-07
+    seed_df = pd.DataFrame(
+        {
+            "Open": [100.0, 102.0, 104.0, 106.0, 108.0],
+            "High": [103.0, 105.0, 107.0, 109.0, 111.0],
+            "Low": [99.0, 101.0, 103.0, 105.0, 107.0],
+            "Close": [101.0, 103.0, 105.0, 107.0, 109.0],
+            "Volume": [1000, 1100, 1200, 1300, 1400],
+        },
+        index=pd.DatetimeIndex(
+            ["2025-01-01", "2025-01-02", "2025-01-03", "2025-01-06", "2025-01-07"],
+            name="Date",
+        ),
+    )
+    monkeypatch.setattr(
+        stock_service.yf,
+        "Ticker",
+        lambda symbol: FakeTicker(seed_df, []),
+    )
+    _ = download_stock_data(
+        "RELIANCE.NS", start="2025-01-01", end="2025-01-07"
+    )
+
+    # Now forbid any yfinance call on cache-covered explicit date ranges
+    def yf_should_not_be_called(*args, **kwargs):
+        pytest.fail("yfinance should not be called on a boundary-covered cache hit")
+
+    monkeypatch.setattr(stock_service.yf, "Ticker", yf_should_not_be_called)
+
+    # 1. Exact boundary hit using string dates
+    exact_hit = download_stock_data(
+        "RELIANCE.NS", start="2025-01-01", end="2025-01-07"
+    )
+    assert len(exact_hit) == 5
+
+    # 2. Interior sub-range hit using date objects and unnormalized symbol casing
+    sub_hit = download_stock_data(
+        " reliance.ns ", start=date(2025, 1, 2), end=date(2025, 1, 6)
+    )
+    assert list(sub_hit.index) == [
+        pd.Timestamp("2025-01-02"),
+        pd.Timestamp("2025-01-03"),
+        pd.Timestamp("2025-01-06"),
+    ]
+    assert list(sub_hit["Close"]) == [103.0, 105.0, 107.0]
+
+    # Verify canonical schema, index format, and dtypes on cached output
+    assert list(sub_hit.columns) == list(CANONICAL_COLUMNS)
+    assert isinstance(sub_hit.index, pd.DatetimeIndex)
+    assert sub_hit.index.name == "Date"
+    assert sub_hit.index.tz is None
+    for col in ("Open", "High", "Low", "Close", "Dividends", "Stock Splits"):
+        assert sub_hit[col].dtype == np.dtype("float64")
+    assert sub_hit["Volume"].dtype == np.dtype("int64")
+
+
+def test_explicit_date_range_cache_misses_fallback_to_yfinance(
+    monkeypatch, tmp_path
+):
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setattr(stock_service, "S3_SYNC_ENABLED", False)
+
+    initial_df = pd.DataFrame(
+        {
+            "Open": [100.0, 102.0, 104.0],
+            "High": [103.0, 105.0, 107.0],
+            "Low": [99.0, 101.0, 103.0],
+            "Close": [101.0, 103.0, 105.0],
+            "Volume": [1000, 1100, 1200],
+        },
+        index=pd.DatetimeIndex(
+            ["2025-01-02", "2025-01-03", "2025-01-06"], name="Date"
+        ),
+    )
+    history_calls = []
+    monkeypatch.setattr(
+        stock_service.yf,
+        "Ticker",
+        lambda symbol: FakeTicker(initial_df, history_calls),
+    )
+
+    # 1. Cold cache miss (database has no data for RELIANCE.NS) -> fetches from yfinance
+    res1 = download_stock_data(
+        "RELIANCE.NS", start="2025-01-02", end="2025-01-06"
+    )
+    assert len(res1) == 3
+    assert len(history_calls) == 1
+
+    # 2. Unknown symbol (TCS.NS not in database) -> fetches from yfinance
+    res_unknown = download_stock_data(
+        "TCS.NS", start="2025-01-02", end="2025-01-06"
+    )
+    assert len(res_unknown) == 3
+    assert len(history_calls) == 2
+
+    # 3. Request starts earlier than stored min_date (2025-01-01 < 2025-01-02) -> cache miss
+    _ = download_stock_data(
+        "RELIANCE.NS", start="2025-01-01", end="2025-01-06"
+    )
+    assert len(history_calls) == 3
+
+    # 4. Request ends later than stored max_date (2025-01-10 > 2025-01-06) -> cache miss
+    _ = download_stock_data(
+        "RELIANCE.NS", start="2025-01-02", end="2025-01-10"
+    )
+    assert len(history_calls) == 4
+
+    # 5. Period-based request on cached symbol still fetches from yfinance
+    _ = download_stock_data("RELIANCE.NS", period="1mo")
+    assert len(history_calls) == 5
+    assert history_calls[-1] == {"period": "1mo"}
+
+
+class CalendarAwareFakeTicker:
+    """
+    Fake yfinance Ticker that strictly models yfinance's exclusive `end` date:
+    returns rows where `start <= Date < end`.
+    """
+
+    def __init__(
+        self,
+        full_df: pd.DataFrame,
+        call_log: list[dict],
+        extra_out_of_range_rows: pd.DataFrame | None = None,
+    ):
+        self._full_df = full_df
+        self._call_log = call_log
+        self._extra = extra_out_of_range_rows
+
+    def history(self, **kwargs) -> pd.DataFrame:
+        self._call_log.append(kwargs)
+        if "start" in kwargs and "end" in kwargs:
+            s = pd.Timestamp(kwargs["start"])
+            e = pd.Timestamp(kwargs["end"])
+            sliced = self._full_df.loc[
+                (self._full_df.index >= s) & (self._full_df.index < e)
+            ].copy()
+            if self._extra is not None:
+                sliced = pd.concat([sliced, self._extra.copy()])
+            return sliced
+        return self._full_df.copy()
+
+
+def _make_calendar_dataset(dates: list[str], base_price: float = 100.0) -> pd.DataFrame:
+    n = len(dates)
+    closes = [base_price + i * 2.0 for i in range(n)]
+    return pd.DataFrame(
+        {
+            "Open": [c - 1.0 for c in closes],
+            "High": [c + 2.0 for c in closes],
+            "Low": [c - 2.0 for c in closes],
+            "Close": closes,
+            "Volume": [1000 + i * 100 for i in range(n)],
+        },
+        index=pd.DatetimeIndex(dates, name="Date"),
+    )
+
+
+def test_disjoint_cached_ranges_do_not_produce_false_cache_hit(
+    monkeypatch, tmp_path
+):
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setattr(stock_service, "S3_SYNC_ENABLED", False)
+
+    cal_df = _make_calendar_dataset(
+        [
+            "2025-01-02",
+            "2025-01-15",
+            "2025-02-05",
+            "2025-02-19",
+            "2025-03-04",
+            "2025-03-20",
+        ]
+    )
+    calls = []
+    monkeypatch.setattr(
+        stock_service.yf,
+        "Ticker",
+        lambda symbol: CalendarAwareFakeTicker(cal_df, calls),
+    )
+
+    # 1. Seed January coverage
+    jan_df = download_stock_data(
+        "RELIANCE.NS", start="2025-01-01", end="2025-01-31"
+    )
+    assert len(jan_df) == 2
+    assert len(calls) == 1
+
+    # 2. Seed March coverage
+    mar_df = download_stock_data(
+        "RELIANCE.NS", start="2025-03-01", end="2025-03-31"
+    )
+    assert len(mar_df) == 2
+    assert len(calls) == 2
+
+    # 3. Request February (between Jan and Mar, but uncovered) -> MUST call yfinance
+    feb_df = download_stock_data(
+        "RELIANCE.NS", start="2025-02-01", end="2025-02-28"
+    )
+    assert len(calls) == 3
+    assert calls[-1] == {"start": "2025-02-01", "end": "2025-03-01"}
+    assert list(feb_df.index) == [
+        pd.Timestamp("2025-02-05"),
+        pd.Timestamp("2025-02-19"),
+    ]
+
+
+def test_inclusive_end_date_semantics_one_day_range_and_hit_miss_identity(
+    monkeypatch, tmp_path
+):
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setattr(stock_service, "S3_SYNC_ENABLED", False)
+
+    cal_df = _make_calendar_dataset(
+        ["2025-01-01", "2025-01-02", "2025-01-03", "2025-01-06", "2025-01-07"]
+    )
+    # Stray row beyond requested end to prove post-validation inclusive filtering
+    stray_row = _make_calendar_dataset(["2025-01-08"], base_price=999.0)
+    calls = []
+    monkeypatch.setattr(
+        stock_service.yf,
+        "Ticker",
+        lambda symbol: CalendarAwareFakeTicker(
+            cal_df, calls, extra_out_of_range_rows=stray_row
+        ),
+    )
+
+    # 1. One-day range (start == end == 2025-01-02) sends exclusive end 2025-01-03 and includes 2025-01-02
+    one_day = download_stock_data(
+        "TCS.NS", start="2025-01-02", end="2025-01-02"
+    )
+    assert calls[-1] == {"start": "2025-01-02", "end": "2025-01-03"}
+    assert list(one_day.index) == [pd.Timestamp("2025-01-02")]
+
+    # 2. Multi-day range: cache miss followed by cache hit returns identical DataFrame
+    miss_df = download_stock_data(
+        "INFY.NS", start="2025-01-01", end="2025-01-06"
+    )
+    assert calls[-1] == {"start": "2025-01-01", "end": "2025-01-07"}
+    assert list(miss_df.index) == [
+        pd.Timestamp("2025-01-01"),
+        pd.Timestamp("2025-01-02"),
+        pd.Timestamp("2025-01-03"),
+        pd.Timestamp("2025-01-06"),
+    ]
+
+    # Forbid provider call on repeat request and verify exact DataFrame equality
+    monkeypatch.setattr(
+        stock_service.yf,
+        "Ticker",
+        lambda *a, **kw: pytest.fail("yfinance should not be called on cache hit"),
+    )
+    hit_df = download_stock_data(
+        "INFY.NS", start="2025-01-01", end="2025-01-06"
+    )
+    pd.testing.assert_frame_equal(hit_df, miss_df)
+
+
+def test_valid_empty_cache_hit_on_weekend_subrange_inside_covered_interval(
+    monkeypatch, tmp_path
+):
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setattr(stock_service, "S3_SYNC_ENABLED", False)
+
+    # Seed 2025-01-01 through 2025-01-07 with weekday bars only (Jan 4-5 is a weekend)
+    cal_df = _make_calendar_dataset(
+        ["2025-01-01", "2025-01-02", "2025-01-03", "2025-01-06", "2025-01-07"]
+    )
+    monkeypatch.setattr(
+        stock_service.yf,
+        "Ticker",
+        lambda symbol: CalendarAwareFakeTicker(cal_df, []),
+    )
+    _ = download_stock_data("RELIANCE.NS", start="2025-01-01", end="2025-01-07")
+
+    # Requesting the interior weekend (2025-01-04..2025-01-05) must hit cache and return empty
+    # canonical DataFrame without calling yfinance
+    monkeypatch.setattr(
+        stock_service.yf,
+        "Ticker",
+        lambda *a, **kw: pytest.fail("yfinance must not be called on weekend sub-range cache hit"),
+    )
+    weekend_df = download_stock_data(
+        "RELIANCE.NS", start="2025-01-04", end="2025-01-05"
+    )
+    assert weekend_df.empty
+    assert list(weekend_df.columns) == list(CANONICAL_COLUMNS)
+    assert isinstance(weekend_df.index, pd.DatetimeIndex)
+    assert weekend_df.index.name == "Date"
+
+
+def test_completed_day_utc_clamp_prevents_caching_today_or_future_dates(
+    monkeypatch, tmp_path
+):
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setattr(stock_service, "S3_SYNC_ENABLED", False)
+    # Simulate current UTC date = 2025-01-06 -> last completed UTC date = 2025-01-05
+    monkeypatch.setattr(
+        stock_service, "_last_completed_date", lambda: "2025-01-05"
+    )
+
+    cal_df = _make_calendar_dataset(
+        ["2025-01-02", "2025-01-03", "2025-01-06"]
+    )
+    calls = []
+    monkeypatch.setattr(
+        stock_service.yf,
+        "Ticker",
+        lambda symbol: CalendarAwareFakeTicker(cal_df, calls),
+    )
+
+    # 1. Request ending "today" (2025-01-06) or in the future (2025-01-10)
+    _ = download_stock_data("TCS.NS", start="2025-01-01", end="2025-01-10")
+    assert len(calls) == 1
+
+    # Coverage was clamped to 2025-01-05:
+    repo = _get_repository()
+    assert repo.is_range_covered("TCS.NS", "2025-01-01", "2025-01-05") is True
+    assert repo.is_range_covered("TCS.NS", "2025-01-01", "2025-01-06") is False
+
+    # Repeat request for completed past range (2025-01-01..2025-01-05) hits cache
+    _ = download_stock_data("TCS.NS", start="2025-01-01", end="2025-01-05")
+    assert len(calls) == 1
+
+    # Repeat request including today/future (2025-01-01..2025-01-06) misses cache and calls provider
+    _ = download_stock_data("TCS.NS", start="2025-01-01", end="2025-01-06")
+    assert len(calls) == 2
+
+    # 2. Request starting today/in future (coverage_end < coverage_start) records NO coverage
+    _ = download_stock_data("INFY.NS", start="2025-01-06", end="2025-01-07")
+    assert len(calls) == 3
+    assert repo.is_range_covered("INFY.NS", "2025-01-06", "2025-01-06") is False
+
+
+def test_filtering_resulting_in_empty_dataframe_skips_all_persistence(
+    monkeypatch, tmp_path
+):
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setattr(stock_service, "S3_SYNC_ENABLED", True)
+    monkeypatch.setattr(stock_service, "AWS_BUCKET_NAME", "test-bucket")
+    monkeypatch.setattr(
+        stock_service.boto3,
+        "client",
+        lambda *a, **kw: pytest.fail("S3 should not be called when filtered data is empty"),
+    )
+
+    # Provider returns a valid non-empty row, but its date (2025-01-15) is outside [2025-01-01, 2025-01-10]
+    out_of_range_only = _make_calendar_dataset(["2025-01-15"])
+    monkeypatch.setattr(
+        stock_service.yf,
+        "Ticker",
+        lambda symbol: FakeTicker(out_of_range_only, []),
+    )
+
+    res = download_stock_data(
+        "OUTOFRANGE.NS", start="2025-01-01", end="2025-01-10"
+    )
+    assert res.empty
+    assert list(res.columns) == list(CANONICAL_COLUMNS)
+
+    repo = _get_repository()
+    assert repo.get_stock_data("OUTOFRANGE.NS").empty
+    assert repo.get_metadata("OUTOFRANGE.NS") is None
+    assert repo.is_range_covered("OUTOFRANGE.NS", "2025-01-01", "2025-01-10") is False
+    assert not (tmp_path / "data" / "OUTOFRANGE.NS.csv").exists()
+
+
+def test_empty_provider_response_and_provider_exception_do_not_corrupt_coverage(
+    monkeypatch, tmp_path
+):
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setattr(stock_service, "S3_SYNC_ENABLED", False)
+
+    # 1. Empty provider response for explicit range writes no coverage, prices, or CSV
+    monkeypatch.setattr(
+        stock_service.yf,
+        "Ticker",
+        lambda symbol: FakeTicker(pd.DataFrame(), []),
+    )
+    empty_res = download_stock_data(
+        "EMPTY.NS", start="2025-01-01", end="2025-01-10"
+    )
+    assert empty_res.empty
+    repo = _get_repository()
+    assert repo.is_range_covered("EMPTY.NS", "2025-01-01", "2025-01-10") is False
+    assert repo.get_metadata("EMPTY.NS") is None
+    assert not (tmp_path / "data" / "EMPTY.NS.csv").exists()
+
+    # 2. Seed valid coverage for RELIANCE.NS, then simulate provider exception on uncovered range
+    seed_df = _make_calendar_dataset(["2025-01-02", "2025-01-03"])
+    monkeypatch.setattr(
+        stock_service.yf,
+        "Ticker",
+        lambda symbol: CalendarAwareFakeTicker(seed_df, []),
+    )
+    _ = download_stock_data("RELIANCE.NS", start="2025-01-01", end="2025-01-05")
+    assert repo.is_range_covered("RELIANCE.NS", "2025-01-01", "2025-01-05") is True
+
+    class RaisingTicker:
+        def history(self, **kwargs):
+            raise RuntimeError("Simulated Yahoo Finance network error")
+
+    monkeypatch.setattr(stock_service.yf, "Ticker", lambda symbol: RaisingTicker())
+
+    with pytest.raises(RuntimeError, match="Simulated Yahoo Finance network error"):
+        download_stock_data("RELIANCE.NS", start="2025-02-01", end="2025-02-10")
+
+    # Existing Jan coverage remains intact and Feb is not marked covered
+    assert repo.is_range_covered("RELIANCE.NS", "2025-01-01", "2025-01-05") is True
+    assert repo.is_range_covered("RELIANCE.NS", "2025-02-01", "2025-02-10") is False
+
+
+def test_reversed_range_and_symbol_normalization_and_csv_path_safety(
+    monkeypatch, tmp_path
+):
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setattr(stock_service, "S3_SYNC_ENABLED", False)
+
+    # 1. Reversed date range raises ValueError before calling provider or touching DB
+    monkeypatch.setattr(
+        stock_service.yf,
+        "Ticker",
+        lambda *a, **kw: pytest.fail("yfinance should not be called on reversed dates"),
+    )
+    with pytest.raises(ValueError, match="start date must be before or equal to end date"):
+        download_stock_data("RELIANCE.NS", start="2025-01-10", end="2025-01-01")
+    assert not (tmp_path / "data" / "market_data.db").exists()
+
+    # 1b. Partially specified date range (start without end, or end without start) raises ValueError
+    with pytest.raises(ValueError, match="Both start and end dates must be provided together"):
+        download_stock_data("RELIANCE.NS", start="2025-01-01")
+    with pytest.raises(ValueError, match="Both start and end dates must be provided together"):
+        download_stock_data("RELIANCE.NS", end="2025-01-10")
+    assert not (tmp_path / "data" / "market_data.db").exists()
+    assert not (tmp_path / "data" / "RELIANCE.NS.csv").exists()
+
+    # 2. Unsafe symbols are rejected with ValueError before calling provider
+    for unsafe_symbol in ["../x", "a/b", "a\\b", "FOO..BAR", "", "   ", "../data/EVIL"]:
+        with pytest.raises(ValueError):
+            download_stock_data(unsafe_symbol, start="2025-01-01", end="2025-01-05")
+
+    # 3. Legitimate Yahoo Finance symbols with special characters normalize and stay inside data/
+    sample_df = _make_calendar_dataset(["2025-01-02"])
+    monkeypatch.setattr(
+        stock_service.yf,
+        "Ticker",
+        lambda symbol: CalendarAwareFakeTicker(sample_df, []),
+    )
+    valid_symbols = [" m&m.ns ", "^NSEI", "EURUSD=X", "BTC-USD", "BRK-B"]
+    data_dir = (tmp_path / "data").resolve()
+
+    for raw_sym in valid_symbols:
+        norm = raw_sym.strip().upper()
+        df = download_stock_data(raw_sym, start="2025-01-01", end="2025-01-05")
+        assert len(df) == 1
+        csv_file = (data_dir / f"{norm}.csv").resolve()
+        assert csv_file.exists()
+        assert csv_file.parent == data_dir
+
+
+def test_end_to_end_api_compare_and_stock_disjoint_range_cache_integration(
+    monkeypatch, tmp_path
+):
+    from fastapi.testclient import TestClient
+    from app.main import app
+
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setattr(stock_service, "S3_SYNC_ENABLED", False)
+
+    cal_df = _make_calendar_dataset(
+        [
+            "2025-01-06",
+            "2025-01-08",
+            "2025-01-10",
+            "2025-01-20",
+            "2025-02-05",
+            "2025-02-12",
+            "2025-04-07",
+            "2025-04-15",
+            "2025-04-25",
+        ]
+    )
+    provider_calls = []
+    monkeypatch.setattr(
+        stock_service.yf,
+        "Ticker",
+        lambda symbol: CalendarAwareFakeTicker(cal_df, provider_calls),
+    )
+
+    api_client = TestClient(app)
+
+    # Step 1: Populate January and April ranges via GET /compare
+    res_compare = api_client.get(
+        "/compare",
+        params={
+            "symbol": "RELIANCE.NS",
+            "start_a": "2025-01-01",
+            "end_a": "2025-01-31",
+            "start_b": "2025-04-01",
+            "end_b": "2025-04-30",
+        },
+    )
+    assert res_compare.status_code == 200
+    assert len(provider_calls) == 2
+
+    # Step 2: Request a covered January sub-range ending on 2025-01-10 via GET /stock
+    res_jan = api_client.get(
+        "/stock",
+        params={
+            "symbol": "RELIANCE.NS",
+            "start": "2025-01-06",
+            "end": "2025-01-10",
+        },
+    )
+    assert res_jan.status_code == 200
+    # Provider is NOT called again (served from SQLite cache)
+    assert len(provider_calls) == 2
+    jan_history = res_jan.json()["history"]
+    returned_jan_dates = [row["Date"][:10] for row in jan_history]
+    assert returned_jan_dates == ["2025-01-06", "2025-01-08", "2025-01-10"]
+
+    # Step 3: Request uncovered February range (between Jan and Apr) via GET /stock
+    res_feb = api_client.get(
+        "/stock",
+        params={
+            "symbol": "RELIANCE.NS",
+            "start": "2025-02-01",
+            "end": "2025-02-28",
+        },
+    )
+    assert res_feb.status_code == 200
+    # Provider IS called because February was not falsely treated as cached
+    assert len(provider_calls) == 3
+    feb_history = res_feb.json()["history"]
+    returned_feb_dates = [row["Date"][:10] for row in feb_history]
+    assert returned_feb_dates == ["2025-02-05", "2025-02-12"]
+
+
 

@@ -1,6 +1,6 @@
 from contextlib import contextmanager
 from dataclasses import dataclass
-from datetime import date, datetime, timezone
+from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
 import sqlite3
 import numpy as np
@@ -233,6 +233,51 @@ class MarketDataRepository:
                 );
                 """
             )
+            conn.execute(
+                """
+                CREATE TABLE IF NOT EXISTS cached_ranges (
+                    symbol TEXT NOT NULL,
+                    start_date TEXT NOT NULL,
+                    end_date TEXT NOT NULL,
+                    PRIMARY KEY (symbol, start_date),
+                    CHECK (start_date <= end_date)
+                );
+                """
+            )
+
+    def is_range_covered(
+        self,
+        symbol: str,
+        start: date | datetime | pd.Timestamp | str,
+        end: date | datetime | pd.Timestamp | str,
+    ) -> bool:
+        """
+        Return True if a single stored coverage interval in `cached_ranges`
+        fully contains the inclusive [start, end] range for `symbol`.
+        """
+        norm_symbol = _normalize_symbol(symbol)
+        start_str = _normalize_query_date(start, "start")
+        end_str = _normalize_query_date(end, "end")
+
+        if start_str is None or end_str is None:
+            raise ValueError("Both start and end dates are required.")
+        if start_str > end_str:
+            raise ValueError("start date must be before or equal to end date.")
+
+        with self._connect() as conn:
+            row = conn.execute(
+                """
+                SELECT 1
+                FROM cached_ranges
+                WHERE symbol = ?
+                  AND start_date <= ?
+                  AND end_date >= ?
+                LIMIT 1;
+                """,
+                (norm_symbol, start_str, end_str),
+            ).fetchone()
+
+        return row is not None
 
     def upsert_stock_data(
         self,
@@ -240,34 +285,39 @@ class MarketDataRepository:
         df: pd.DataFrame,
         mark_full_history: bool = False,
         synced_at: datetime | str | None = None,
+        coverage_start: date | datetime | pd.Timestamp | str | None = None,
+        coverage_end: date | datetime | pd.Timestamp | str | None = None,
     ) -> int:
         """
-        Atomically upsert canonical daily OHLCV rows and recalculate ingestion metadata.
+        Atomically upsert canonical daily OHLCV rows, recalculate ingestion metadata,
+        and optionally merge a covered date interval into `cached_ranges`.
 
         Empty DataFrame behavior:
-        - If `df` is empty, no rows in `daily_prices` are deleted or modified.
-        - If metadata already exists for `symbol`, `last_synced_at` (and `has_full_history`
-          if `mark_full_history=True`) is updated while preserving `min_date`, `max_date`,
-          and `row_count`.
-        - If no rows exist yet for `symbol`, no metadata record is created.
-        - Returns the number of price rows upserted (`0` for an empty DataFrame).
+        - After validating arguments, an empty DataFrame is a strict no-op returning `0`:
+          it does not insert prices, update metadata, promote `has_full_history`,
+          or modify `cached_ranges`.
         """
         norm_symbol = _normalize_symbol(symbol)
         _verify_canonical_dataframe(df)
         norm_synced_at = _normalize_synced_at(synced_at)
         full_history_flag = 1 if bool(mark_full_history) else 0
 
-        if df.empty:
-            with self._connect() as conn:
-                conn.execute(
-                    """
-                    UPDATE ingestion_metadata
-                    SET last_synced_at = ?,
-                        has_full_history = MAX(has_full_history, ?)
-                    WHERE symbol = ?;
-                    """,
-                    (norm_synced_at, full_history_flag, norm_symbol),
+        if (coverage_start is None) != (coverage_end is None):
+            raise ValueError(
+                "coverage_start and coverage_end must be provided together or both omitted."
+            )
+
+        cov_start_str: str | None = None
+        cov_end_str: str | None = None
+        if coverage_start is not None and coverage_end is not None:
+            cov_start_str = _normalize_query_date(coverage_start, "coverage_start")
+            cov_end_str = _normalize_query_date(coverage_end, "coverage_end")
+            if cov_start_str > cov_end_str:
+                raise ValueError(
+                    "coverage_start must be before or equal to coverage_end."
                 )
+
+        if df.empty:
             return 0
 
         working = df[list(CANONICAL_COLUMNS)].copy()
@@ -340,6 +390,47 @@ class MarketDataRepository:
                     int(row_count),
                 ),
             )
+
+            if cov_start_str is not None and cov_end_str is not None:
+                lo_date = (
+                    date.fromisoformat(cov_start_str) - timedelta(days=1)
+                ).isoformat()
+                hi_date = (
+                    date.fromisoformat(cov_end_str) + timedelta(days=1)
+                ).isoformat()
+
+                touching_rows = conn.execute(
+                    """
+                    SELECT start_date, end_date
+                    FROM cached_ranges
+                    WHERE symbol = ?
+                      AND start_date <= ?
+                      AND end_date >= ?;
+                    """,
+                    (norm_symbol, hi_date, lo_date),
+                ).fetchall()
+
+                merged_start = min([cov_start_str, *(r[0] for r in touching_rows)])
+                merged_end = max([cov_end_str, *(r[1] for r in touching_rows)])
+
+                if touching_rows:
+                    conn.execute(
+                        """
+                        DELETE FROM cached_ranges
+                        WHERE symbol = ?
+                          AND start_date <= ?
+                          AND end_date >= ?;
+                        """,
+                        (norm_symbol, hi_date, lo_date),
+                    )
+
+                conn.execute(
+                    """
+                    INSERT INTO cached_ranges (symbol, start_date, end_date)
+                    VALUES (?, ?, ?);
+                    """,
+                    (norm_symbol, merged_start, merged_end),
+                )
 
         return len(records)
 

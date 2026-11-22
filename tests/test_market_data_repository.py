@@ -72,7 +72,7 @@ def test_schema_and_parent_directory_auto_creation(tmp_path):
                 "SELECT name FROM sqlite_master WHERE type='table';"
             ).fetchall()
         }
-        assert {"daily_prices", "ingestion_metadata"}.issubset(tables)
+        assert {"daily_prices", "ingestion_metadata", "cached_ranges"}.issubset(tables)
 
         price_cols = [
             row[1]
@@ -483,4 +483,246 @@ def test_rejects_same_day_multiple_timestamps_and_non_midnight_dates_without_col
         pd.Timestamp("2025-01-01"),
         pd.Timestamp("2025-01-02"),
     ]
+
+
+def _read_cached_ranges(repo: MarketDataRepository, symbol: str) -> list[tuple[str, str]]:
+    with sqlite3.connect(repo.db_path) as conn:
+        return conn.execute(
+            """
+            SELECT start_date, end_date
+            FROM cached_ranges
+            WHERE symbol = ?
+            ORDER BY start_date ASC;
+            """,
+            (symbol,),
+        ).fetchall()
+
+
+def test_coverage_lookup_and_interval_merging_rules(tmp_path):
+    repo = MarketDataRepository(db_path=tmp_path / "market_data.db")
+    sample_bar = make_canonical_df(dates=["2025-01-02"], closes=[100.0])
+
+    # 1. Seed two disjoint intervals: Jan 1-10 and Jan 20-31
+    repo.upsert_stock_data(
+        "RELIANCE.NS",
+        sample_bar,
+        coverage_start="2025-01-01",
+        coverage_end="2025-01-10",
+    )
+    repo.upsert_stock_data(
+        "RELIANCE.NS",
+        sample_bar,
+        coverage_start="2025-01-20",
+        coverage_end="2025-01-31",
+    )
+    assert _read_cached_ranges(repo, "RELIANCE.NS") == [
+        ("2025-01-01", "2025-01-10"),
+        ("2025-01-20", "2025-01-31"),
+    ]
+
+    # Coverage lookup checks:
+    assert repo.is_range_covered("reliance.ns", "2025-01-01", "2025-01-10") is True
+    assert repo.is_range_covered("RELIANCE.NS", "2025-01-03", "2025-01-08") is True
+    # Partially outside covered range -> False
+    assert repo.is_range_covered("RELIANCE.NS", "2025-01-05", "2025-01-15") is False
+    # Spanning two disjoint intervals -> False
+    assert repo.is_range_covered("RELIANCE.NS", "2025-01-05", "2025-01-25") is False
+    # Uncovered gap between disjoint intervals -> False
+    assert repo.is_range_covered("RELIANCE.NS", "2025-01-12", "2025-01-18") is False
+    # Different symbol -> False
+    assert repo.is_range_covered("TCS.NS", "2025-01-01", "2025-01-10") is False
+    # Reversed range -> raises ValueError
+    with pytest.raises(ValueError, match="start date must be before or equal to end date"):
+        repo.is_range_covered("RELIANCE.NS", "2025-01-10", "2025-01-01")
+
+    # 2. Overlapping interval (Jan 8-14 overlaps Jan 1-10) -> merges to Jan 1-14
+    repo.upsert_stock_data(
+        "RELIANCE.NS",
+        sample_bar,
+        coverage_start="2025-01-08",
+        coverage_end="2025-01-14",
+    )
+    assert _read_cached_ranges(repo, "RELIANCE.NS") == [
+        ("2025-01-01", "2025-01-14"),
+        ("2025-01-20", "2025-01-31"),
+    ]
+
+    # 3. One-calendar-day gap (Jan 16-18 leaves Jan 15 uncovered) -> remains separate
+    repo.upsert_stock_data(
+        "RELIANCE.NS",
+        sample_bar,
+        coverage_start="2025-01-16",
+        coverage_end="2025-01-18",
+    )
+    assert _read_cached_ranges(repo, "RELIANCE.NS") == [
+        ("2025-01-01", "2025-01-14"),
+        ("2025-01-16", "2025-01-18"),
+        ("2025-01-20", "2025-01-31"),
+    ]
+
+    # 4. Calendar-adjacent interval (Jan 19 touches both Jan 16-18 and Jan 20-31) -> merges both into Jan 16-31
+    repo.upsert_stock_data(
+        "RELIANCE.NS",
+        sample_bar,
+        coverage_start="2025-01-19",
+        coverage_end="2025-01-19",
+    )
+    assert _read_cached_ranges(repo, "RELIANCE.NS") == [
+        ("2025-01-01", "2025-01-14"),
+        ("2025-01-16", "2025-01-31"),
+    ]
+
+    # 5. Bridging gap (Jan 15 bridges Jan 1-14 and Jan 16-31) -> merges into a single Jan 1-31 interval
+    repo.upsert_stock_data(
+        "RELIANCE.NS",
+        sample_bar,
+        coverage_start="2025-01-15",
+        coverage_end="2025-01-15",
+    )
+    assert _read_cached_ranges(repo, "RELIANCE.NS") == [
+        ("2025-01-01", "2025-01-31"),
+    ]
+    assert repo.is_range_covered("RELIANCE.NS", "2025-01-01", "2025-01-31") is True
+
+    # 6. Fully contained interval (Jan 5-12 inside Jan 1-31) -> no duplicates created
+    repo.upsert_stock_data(
+        "RELIANCE.NS",
+        sample_bar,
+        coverage_start="2025-01-05",
+        coverage_end="2025-01-12",
+    )
+    assert _read_cached_ranges(repo, "RELIANCE.NS") == [
+        ("2025-01-01", "2025-01-31"),
+    ]
+
+
+def test_empty_upsert_strict_noop_and_invalid_coverage_arguments(tmp_path):
+    repo = MarketDataRepository(db_path=tmp_path / "market_data.db")
+    t1 = datetime(2025, 1, 10, 9, 0, 0, tzinfo=timezone.utc)
+    seed_df = make_canonical_df(
+        dates=["2025-01-02", "2025-01-03"], closes=[100.0, 105.0]
+    )
+    repo.upsert_stock_data(
+        "TCS.NS",
+        seed_df,
+        mark_full_history=False,
+        synced_at=t1,
+        coverage_start="2025-01-01",
+        coverage_end="2025-01-05",
+    )
+
+    # 1. Invalid coverage arguments must raise ValueError BEFORE empty-DataFrame early return
+    with pytest.raises(ValueError, match="provided together"):
+        repo.upsert_stock_data(
+            "TCS.NS", pd.DataFrame(), coverage_start="2025-01-01"
+        )
+    with pytest.raises(ValueError, match="provided together"):
+        repo.upsert_stock_data(
+            "TCS.NS", pd.DataFrame(), coverage_end="2025-01-05"
+        )
+    with pytest.raises(
+        ValueError, match="coverage_start must be before or equal to coverage_end"
+    ):
+        repo.upsert_stock_data(
+            "TCS.NS",
+            pd.DataFrame(),
+            coverage_start="2025-01-10",
+            coverage_end="2025-01-01",
+        )
+    with pytest.raises(
+        ValueError, match="coverage_start must be before or equal to coverage_end"
+    ):
+        repo.upsert_stock_data(
+            "TCS.NS",
+            seed_df,
+            coverage_start="2025-01-10",
+            coverage_end="2025-01-01",
+        )
+
+    # 2. Empty DataFrame with valid arguments is a strict no-op (does not promote has_full_history,
+    # does not update last_synced_at, and does not write cached_ranges)
+    t2 = datetime(2025, 1, 15, 12, 0, 0, tzinfo=timezone.utc)
+    res = repo.upsert_stock_data(
+        "TCS.NS",
+        pd.DataFrame(),
+        mark_full_history=True,
+        synced_at=t2,
+        coverage_start="2025-01-01",
+        coverage_end="2025-01-31",
+    )
+    assert res == 0
+    assert len(repo.get_stock_data("TCS.NS")) == 2
+    meta = repo.get_metadata("TCS.NS")
+    assert meta == SymbolMetadata(
+        symbol="TCS.NS",
+        min_date="2025-01-02",
+        max_date="2025-01-03",
+        last_synced_at="2025-01-10T09:00:00+00:00",
+        has_full_history=False,
+        row_count=2,
+    )
+    assert _read_cached_ranges(repo, "TCS.NS") == [("2025-01-01", "2025-01-05")]
+
+
+def test_atomicity_rolls_back_prices_and_coverage_when_coverage_write_fails(
+    tmp_path, monkeypatch
+):
+    repo = MarketDataRepository(db_path=tmp_path / "market_data.db")
+    initial_df = make_canonical_df(dates=["2025-01-02"], closes=[100.0])
+    t_initial = datetime(2025, 1, 2, 16, 0, 0, tzinfo=timezone.utc)
+    repo.upsert_stock_data(
+        "INFY.NS",
+        initial_df,
+        synced_at=t_initial,
+        coverage_start="2025-01-01",
+        coverage_end="2025-01-02",
+    )
+
+    new_batch = make_canonical_df(
+        dates=["2025-01-02", "2025-01-03"], closes=[200.0, 210.0]
+    )
+    original_connect = repo._connect
+
+    class FailingCoverageConnection:
+        def __init__(self, real_conn):
+            self._real_conn = real_conn
+
+        def executemany(self, sql, params):
+            return self._real_conn.executemany(sql, params)
+
+        def execute(self, sql, params=()):
+            if "INSERT INTO cached_ranges" in sql:
+                raise sqlite3.OperationalError("Simulated failure during coverage write")
+            return self._real_conn.execute(sql, params)
+
+    from contextlib import contextmanager
+
+    @contextmanager
+    def failing_connect():
+        raw_conn = sqlite3.connect(repo.db_path)
+        try:
+            with raw_conn:
+                yield FailingCoverageConnection(raw_conn)
+        finally:
+            raw_conn.close()
+
+    monkeypatch.setattr(repo, "_connect", failing_connect)
+
+    with pytest.raises(sqlite3.OperationalError, match="Simulated failure during coverage write"):
+        repo.upsert_stock_data(
+            "INFY.NS",
+            new_batch,
+            coverage_start="2025-01-01",
+            coverage_end="2025-01-05",
+        )
+
+    monkeypatch.setattr(repo, "_connect", original_connect)
+    stored = repo.get_stock_data("INFY.NS")
+    assert len(stored) == 1
+    assert list(stored["Close"]) == [100.0]
+    meta = repo.get_metadata("INFY.NS")
+    assert meta.row_count == 1
+    assert meta.last_synced_at == "2025-01-02T16:00:00+00:00"
+    assert _read_cached_ranges(repo, "INFY.NS") == [("2025-01-01", "2025-01-02")]
+
 
