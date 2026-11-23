@@ -9,9 +9,13 @@ from app.services.data_validator import (
     CANONICAL_COLUMNS,
     validate_and_normalize_stock_data,
 )
-from app.services.market_data_repository import MarketDataRepository
+from app.services.market_data_repository import (
+    MarketDataRepository,
+    SymbolMetadata,
+)
 from app.services.stock_service import (
     _get_repository,
+    _is_cache_fresh,
     calculate_daily_returns,
     download_stock_data,
 )
@@ -1339,11 +1343,12 @@ def test_freshness_metadata_qualification_across_service_flows(
 
     clock_values = iter(
         [
-            datetime(2025, 1, 21, 9, 0, 0, tzinfo=timezone.utc),   # T1
-            datetime(2025, 1, 21, 10, 0, 0, tzinfo=timezone.utc),  # T2
-            datetime(2025, 1, 21, 11, 0, 0, tzinfo=timezone.utc),  # T3
-            datetime(2025, 1, 21, 12, 0, 0, tzinfo=timezone.utc),  # T4
-            datetime(2025, 1, 21, 13, 0, 0, tzinfo=timezone.utc),  # T5
+            datetime(2025, 1, 21, 9, 0, 0, tzinfo=timezone.utc),    # T1 (step 1 historical upsert)
+            datetime(2025, 1, 21, 10, 0, 0, tzinfo=timezone.utc),   # T2 (step 2 recent-edge upsert)
+            datetime(2025, 1, 21, 10, 30, 0, tzinfo=timezone.utc),  # Step 3 freshness check (30m < 1h TTL -> fresh hit)
+            datetime(2025, 1, 21, 11, 0, 0, tzinfo=timezone.utc),   # T3 (step 4 period upsert)
+            datetime(2025, 1, 21, 12, 0, 0, tzinfo=timezone.utc),   # T4 (step 4 historical backfill)
+            datetime(2025, 1, 21, 13, 0, 0, tzinfo=timezone.utc),   # T5 (step 6 partial failure gap 1)
         ]
     )
     monkeypatch.setattr(stock_service, "_utc_now", lambda: next(clock_values))
@@ -1460,6 +1465,243 @@ def test_freshness_metadata_qualification_across_service_flows(
     infy_meta = repo.get_metadata("INFY.NS")
     assert infy_meta.last_synced_at == "2025-01-21T13:00:00+00:00"
     assert infy_meta.last_refreshed_at is None
+
+
+def test_is_cache_fresh_helper_edge_cases():
+    from datetime import datetime, timedelta, timezone
+
+    now_utc = datetime(2025, 1, 21, 12, 0, 0, tzinfo=timezone.utc)
+
+    def make_meta(refreshed_at: str | None) -> SymbolMetadata:
+        return SymbolMetadata(
+            symbol="RELIANCE.NS",
+            min_date="2025-01-01",
+            max_date="2025-01-20",
+            last_synced_at="2025-01-21T11:00:00+00:00",
+            has_full_history=False,
+            row_count=10,
+            last_refreshed_at=refreshed_at,
+        )
+
+    # 1. Missing metadata or missing/empty/invalid last_refreshed_at -> False
+    assert _is_cache_fresh(None, now_utc, 3600) is False
+    assert _is_cache_fresh(make_meta(None), now_utc, 3600) is False
+    assert _is_cache_fresh(make_meta(""), now_utc, 3600) is False
+    assert _is_cache_fresh(make_meta("   "), now_utc, 3600) is False
+    assert _is_cache_fresh(make_meta("not-a-timestamp"), now_utc, 3600) is False
+
+    # 2. Fresh timestamp (within TTL and exact TTL boundary) -> True
+    assert _is_cache_fresh(make_meta("2025-01-21T11:30:00+00:00"), now_utc, 3600) is True
+    assert _is_cache_fresh(make_meta("2025-01-21T11:00:00+00:00"), now_utc, 3600) is True
+
+    # 3. Expired timestamp (older than TTL) -> False
+    assert _is_cache_fresh(make_meta("2025-01-21T10:59:59+00:00"), now_utc, 3600) is False
+
+    # 4. Non-positive TTL -> False
+    assert _is_cache_fresh(make_meta("2025-01-21T12:00:00+00:00"), now_utc, 0) is False
+    assert _is_cache_fresh(make_meta("2025-01-21T12:00:00+00:00"), now_utc, -60) is False
+
+    # 5. Timezone handling: naive timestamp & non-UTC offset (+05:30) compared safely without TypeError
+    # 2025-01-21T17:00:00+05:30 == 2025-01-21T11:30:00+00:00 (30m before 12:00 UTC)
+    assert _is_cache_fresh(make_meta("2025-01-21T17:00:00+05:30"), now_utc, 3600) is True
+    naive_now = datetime(2025, 1, 21, 12, 0, 0)
+    assert _is_cache_fresh(make_meta("2025-01-21T11:30:00"), naive_now, 3600) is True
+
+    # 6. Future timestamp (corrupted metadata or clock skew ahead of now_utc) -> False
+    future_ts = (now_utc + timedelta(minutes=5)).isoformat()
+    assert _is_cache_fresh(make_meta(future_ts), now_utc, 3600) is False
+
+
+def test_recent_edge_freshness_policy_fresh_hit_stale_targeted_refresh_and_historical_immunity(
+    monkeypatch, tmp_path
+):
+    from datetime import datetime, timezone
+
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setattr(stock_service, "S3_SYNC_ENABLED", False)
+    monkeypatch.setattr(stock_service, "CACHE_FRESHNESS_TTL_SECONDS", 3600)
+    monkeypatch.setattr(
+        stock_service, "_last_completed_date", lambda: "2025-01-20"
+    )
+
+    current_clock = {"now": datetime(2025, 1, 21, 10, 0, 0, tzinfo=timezone.utc)}
+    monkeypatch.setattr(stock_service, "_utc_now", lambda: current_clock["now"])
+
+    cal_df = _make_calendar_dataset(
+        ["2025-01-02", "2025-01-10", "2025-01-15", "2025-01-20"],
+        base_price=100.0,
+    )
+    calls = []
+    monkeypatch.setattr(
+        stock_service.yf,
+        "Ticker",
+        lambda symbol: CalendarAwareFakeTicker(cal_df, calls),
+    )
+
+    # Initial fetch covering 2025-01-01..2025-01-20 (reaches last_completed=2025-01-20)
+    initial_df = download_stock_data(
+        "RELIANCE.NS", start="2025-01-01", end="2025-01-20"
+    )
+    assert len(calls) == 1
+    assert len(initial_df) == 4
+    assert initial_df.loc[pd.Timestamp("2025-01-20"), "Close"] == 106.0
+
+    # 1. Fresh fully covered recent-edge request (30 minutes later, within 3600s TTL):
+    # Zero provider calls, no CSV/S3 side effects
+    current_clock["now"] = datetime(2025, 1, 21, 10, 30, 0, tzinfo=timezone.utc)
+    csv_path = tmp_path / "data" / "RELIANCE.NS.csv"
+    csv_path.unlink()
+    monkeypatch.setattr(stock_service, "S3_SYNC_ENABLED", True)
+    monkeypatch.setattr(stock_service, "AWS_BUCKET_NAME", "test-bucket")
+    monkeypatch.setattr(
+        stock_service.boto3,
+        "client",
+        lambda *a, **kw: pytest.fail("S3 must not be called on a fresh cache hit"),
+    )
+
+    fresh_hit_df = download_stock_data(
+        "RELIANCE.NS", start="2025-01-01", end="2025-01-20"
+    )
+    assert len(calls) == 1
+    pd.testing.assert_frame_equal(fresh_hit_df, initial_df)
+    assert not csv_path.exists()
+
+    # 2. Stale fully covered recent-edge request (2 hours after initial refresh > 3600s TTL):
+    # Makes ONE targeted provider call ONLY for (2025-01-20, 2025-01-20) -> exclusive end 2025-01-21
+    monkeypatch.setattr(stock_service, "S3_SYNC_ENABLED", False)
+    current_clock["now"] = datetime(2025, 1, 21, 12, 1, 0, tzinfo=timezone.utc)
+
+    # Update provider price for 2025-01-20 to 150.0 to prove the refreshed edge bar is persisted
+    updated_cal_df = cal_df.copy()
+    updated_cal_df.loc[pd.Timestamp("2025-01-20"), "Open"] = 148.0
+    updated_cal_df.loc[pd.Timestamp("2025-01-20"), "High"] = 152.0
+    updated_cal_df.loc[pd.Timestamp("2025-01-20"), "Low"] = 147.0
+    updated_cal_df.loc[pd.Timestamp("2025-01-20"), "Close"] = 150.0
+    monkeypatch.setattr(
+        stock_service.yf,
+        "Ticker",
+        lambda symbol: CalendarAwareFakeTicker(updated_cal_df, calls),
+    )
+
+    refreshed_df = download_stock_data(
+        "RELIANCE.NS", start="2025-01-01", end="2025-01-20"
+    )
+    assert len(calls) == 2
+    assert calls[-1] == {"start": "2025-01-20", "end": "2025-01-21"}
+    # Returns full requested range assembled from SQLite with updated edge close
+    assert len(refreshed_df) == 4
+    assert refreshed_df.loc[pd.Timestamp("2025-01-02"), "Close"] == 100.0
+    assert refreshed_df.loc[pd.Timestamp("2025-01-20"), "Close"] == 150.0
+
+    repo = _get_repository()
+    meta = repo.get_metadata("RELIANCE.NS")
+    assert meta.last_refreshed_at == "2025-01-21T12:01:00+00:00"
+
+    # 3. Historical fully covered request (req_end < last_completed) even after TTL expires:
+    # No TTL evaluation, zero provider calls
+    current_clock["now"] = datetime(2025, 1, 22, 18, 0, 0, tzinfo=timezone.utc)
+    hist_df = download_stock_data(
+        "RELIANCE.NS", start="2025-01-01", end="2025-01-15"
+    )
+    assert len(calls) == 2
+    assert len(hist_df) == 3
+
+    # 4. Missing refresh metadata (last_refreshed_at is None) on covered recent-edge range
+    # is treated as stale and triggers targeted edge refresh
+    repo.upsert_stock_data(
+        "TCS.NS",
+        validate_and_normalize_stock_data(cal_df),
+        synced_at="2025-01-21T08:00:00+00:00",
+        coverage_start="2025-01-01",
+        coverage_end="2025-01-20",
+        mark_refreshed=False,
+    )
+    assert repo.get_metadata("TCS.NS").last_refreshed_at is None
+
+    tcs_df = download_stock_data("TCS.NS", start="2025-01-01", end="2025-01-20")
+    assert len(calls) == 3
+    assert calls[-1] == {"start": "2025-01-20", "end": "2025-01-21"}
+    assert len(tcs_df) == 4
+    assert repo.get_metadata("TCS.NS").last_refreshed_at == "2025-01-22T18:00:00+00:00"
+
+
+def test_stale_recent_edge_refresh_error_fallback_and_empty_refresh(
+    monkeypatch, tmp_path, caplog
+):
+    from datetime import datetime, timezone
+
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setattr(stock_service, "S3_SYNC_ENABLED", False)
+    monkeypatch.setattr(stock_service, "CACHE_FRESHNESS_TTL_SECONDS", 3600)
+    monkeypatch.setattr(
+        stock_service, "_last_completed_date", lambda: "2025-01-20"
+    )
+
+    current_clock = {"now": datetime(2025, 1, 21, 9, 0, 0, tzinfo=timezone.utc)}
+    monkeypatch.setattr(stock_service, "_utc_now", lambda: current_clock["now"])
+
+    cal_df = _make_calendar_dataset(
+        ["2025-01-02", "2025-01-10", "2025-01-20"],
+        base_price=200.0,
+    )
+    calls = []
+    monkeypatch.setattr(
+        stock_service.yf,
+        "Ticker",
+        lambda symbol: CalendarAwareFakeTicker(cal_df, calls),
+    )
+
+    # Seed covered range 2025-01-01..2025-01-20 at 09:00 UTC
+    seeded_df = download_stock_data(
+        "INFY.NS", start="2025-01-01", end="2025-01-20"
+    )
+    assert len(calls) == 1
+    repo = _get_repository()
+    meta_initial = repo.get_metadata("INFY.NS")
+    assert meta_initial.last_refreshed_at == "2025-01-21T09:00:00+00:00"
+
+    # Advance clock past TTL (11:00 UTC -> 2h > 1h TTL)
+    current_clock["now"] = datetime(2025, 1, 21, 11, 0, 0, tzinfo=timezone.utc)
+
+    # 1. Stale refresh provider failure -> logs warning, returns cached SQLite data, preserves metadata
+    class FailingProviderTicker:
+        def history(self, **kwargs):
+            calls.append(kwargs)
+            raise RuntimeError("Simulated provider outage during stale refresh")
+
+    monkeypatch.setattr(
+        stock_service.yf, "Ticker", lambda symbol: FailingProviderTicker()
+    )
+    with caplog.at_level(logging.WARNING, logger="app.services.stock_service"):
+        fallback_df = download_stock_data(
+            "INFY.NS", start="2025-01-01", end="2025-01-20"
+        )
+
+    assert len(calls) == 2
+    assert calls[-1] == {"start": "2025-01-20", "end": "2025-01-21"}
+    pd.testing.assert_frame_equal(fallback_df, seeded_df)
+    assert repo.get_metadata("INFY.NS") == meta_initial
+    assert any(
+        "Stale recent-edge refresh failed" in r.message and "INFY.NS" in r.message
+        for r in caplog.records
+    )
+
+    # Confirm genuinely uncovered gap failure is NOT suppressed by stale-on-error fallback
+    with pytest.raises(RuntimeError, match="Simulated provider outage"):
+        download_stock_data("UNCOVERED.NS", start="2025-01-01", end="2025-01-20")
+
+    # 2. Empty targeted refresh -> returns existing cached data, does not update last_refreshed_at
+    monkeypatch.setattr(
+        stock_service.yf,
+        "Ticker",
+        lambda symbol: FakeTicker(pd.DataFrame(), calls),
+    )
+    empty_refresh_df = download_stock_data(
+        "INFY.NS", start="2025-01-01", end="2025-01-20"
+    )
+    pd.testing.assert_frame_equal(empty_refresh_df, seeded_df)
+    assert repo.get_metadata("INFY.NS") == meta_initial
+
 
 
 

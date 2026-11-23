@@ -12,6 +12,7 @@ from app.services.data_validator import validate_and_normalize_stock_data
 from app.services.market_data_repository import (
     DEFAULT_DB_PATH,
     MarketDataRepository,
+    SymbolMetadata,
     _normalize_query_date,
 )
 
@@ -29,6 +30,9 @@ S3_SYNC_ENABLED = os.getenv("S3_SYNC_ENABLED", "false").strip().lower() in (
 )
 DB_PATH = os.getenv("MARKET_DATA_DB_PATH", str(DEFAULT_DB_PATH))
 MAX_SELECTIVE_GAPS = 3
+CACHE_FRESHNESS_TTL_SECONDS = int(
+    os.getenv("CACHE_FRESHNESS_TTL_SECONDS", "3600")
+)
 
 _SYMBOL_PATTERN = re.compile(r"^\^?[A-Z0-9][A-Z0-9.&=\-]{0,29}$")
 
@@ -69,6 +73,42 @@ def _last_completed_date() -> str:
     return (_utc_now().date() - timedelta(days=1)).isoformat()
 
 
+def _is_cache_fresh(
+    meta: SymbolMetadata | None,
+    now_utc: datetime,
+    ttl_seconds: int,
+) -> bool:
+    if meta is None or not meta.last_refreshed_at or not isinstance(meta.last_refreshed_at, str):
+        return False
+    if ttl_seconds is None or ttl_seconds <= 0 or not isinstance(now_utc, datetime):
+        return False
+
+    raw_ts = meta.last_refreshed_at.strip()
+    if not raw_ts:
+        return False
+
+    try:
+        refreshed_dt = datetime.fromisoformat(raw_ts)
+    except (ValueError, TypeError):
+        return False
+
+    if refreshed_dt.tzinfo is None:
+        refreshed_utc = refreshed_dt.replace(tzinfo=timezone.utc)
+    else:
+        refreshed_utc = refreshed_dt.astimezone(timezone.utc)
+
+    if now_utc.tzinfo is None:
+        now_utc_norm = now_utc.replace(tzinfo=timezone.utc)
+    else:
+        now_utc_norm = now_utc.astimezone(timezone.utc)
+
+    age_seconds = (now_utc_norm - refreshed_utc).total_seconds()
+    if age_seconds < 0:
+        return False
+
+    return age_seconds <= ttl_seconds
+
+
 def download_stock_data(symbol, period="1mo", start=None, end=None):
  norm_symbol = _validate_and_normalize_symbol(symbol)
 
@@ -82,22 +122,47 @@ def download_stock_data(symbol, period="1mo", start=None, end=None):
         raise ValueError("start date must be before or equal to end date.")
 
     repo = _get_repository()
+    last_completed = _last_completed_date()
     missing_gaps = repo.get_missing_ranges(norm_symbol, req_start, req_end)
-    if not missing_gaps:
-        return repo.get_stock_data(norm_symbol, start=req_start, end=req_end)
+    is_stale_edge_refresh = False
 
-    if len(missing_gaps) > MAX_SELECTIVE_GAPS:
+    if not missing_gaps:
+        if req_end == last_completed:
+            meta = repo.get_metadata(norm_symbol)
+            if _is_cache_fresh(
+                meta, _utc_now(), CACHE_FRESHNESS_TTL_SECONDS
+            ):
+                return repo.get_stock_data(
+                    norm_symbol, start=req_start, end=req_end
+                )
+            fetch_gaps = [(last_completed, last_completed)]
+            is_stale_edge_refresh = True
+        else:
+            return repo.get_stock_data(
+                norm_symbol, start=req_start, end=req_end
+            )
+    elif len(missing_gaps) > MAX_SELECTIVE_GAPS:
         fetch_gaps = [(missing_gaps[0][0], missing_gaps[-1][1])]
     else:
         fetch_gaps = missing_gaps
 
-    last_completed = _last_completed_date()
     ticker = yf.Ticker(norm_symbol)
     persisted_any = False
 
     for gap_start, gap_end in fetch_gaps:
         yf_end = (date.fromisoformat(gap_end) + timedelta(days=1)).isoformat()
-        gap_data = ticker.history(start=gap_start, end=yf_end)
+        try:
+            gap_data = ticker.history(start=gap_start, end=yf_end)
+        except Exception as exc:
+            if is_stale_edge_refresh:
+                logger.warning(
+                    "Stale recent-edge refresh failed for %s (%s); serving cached data: %s",
+                    norm_symbol,
+                    gap_start,
+                    exc,
+                )
+                continue
+            raise
         gap_data = validate_and_normalize_stock_data(gap_data, symbol=norm_symbol)
         gap_data = gap_data.loc[
             (gap_data.index >= pd.Timestamp(gap_start))
