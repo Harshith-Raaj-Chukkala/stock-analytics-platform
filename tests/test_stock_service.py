@@ -985,4 +985,345 @@ def test_end_to_end_api_compare_and_stock_disjoint_range_cache_integration(
     assert returned_feb_dates == ["2025-02-05", "2025-02-12"]
 
 
+def test_selective_fetching_backfill_forward_fill_interior_and_multiple_gaps(
+    monkeypatch, tmp_path
+):
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setattr(stock_service, "S3_SYNC_ENABLED", False)
+
+    cal_df = _make_calendar_dataset(
+        [
+            "2025-01-03",
+            "2025-01-08",
+            "2025-01-13",
+            "2025-01-17",
+            "2025-01-23",
+            "2025-01-29",
+        ]
+    )
+    calls = []
+    monkeypatch.setattr(
+        stock_service.yf,
+        "Ticker",
+        lambda symbol: CalendarAwareFakeTicker(cal_df, calls),
+    )
+
+    # 1. Seed middle range Jan 10-20
+    mid_df = download_stock_data(
+        "RELIANCE.NS", start="2025-01-10", end="2025-01-20"
+    )
+    assert list(mid_df.index) == [
+        pd.Timestamp("2025-01-13"),
+        pd.Timestamp("2025-01-17"),
+    ]
+    assert len(calls) == 1
+    assert calls[-1] == {"start": "2025-01-10", "end": "2025-01-21"}
+
+    # 2. Backfill (request Jan 1-20): fetches ONLY missing leading gap Jan 1-9 (exclusive end Jan 10)
+    backfill_df = download_stock_data(
+        "RELIANCE.NS", start="2025-01-01", end="2025-01-20"
+    )
+    assert len(calls) == 2
+    assert calls[-1] == {"start": "2025-01-01", "end": "2025-01-10"}
+    assert list(backfill_df.index) == [
+        pd.Timestamp("2025-01-03"),
+        pd.Timestamp("2025-01-08"),
+        pd.Timestamp("2025-01-13"),
+        pd.Timestamp("2025-01-17"),
+    ]
+
+    # 3. Forward fill (request Jan 1-31): fetches ONLY missing trailing gap Jan 21-31 (exclusive end Feb 1)
+    full_jan_df = download_stock_data(
+        "RELIANCE.NS", start="2025-01-01", end="2025-01-31"
+    )
+    assert len(calls) == 3
+    assert calls[-1] == {"start": "2025-01-21", "end": "2025-02-01"}
+    assert list(full_jan_df.index) == [
+        pd.Timestamp("2025-01-03"),
+        pd.Timestamp("2025-01-08"),
+        pd.Timestamp("2025-01-13"),
+        pd.Timestamp("2025-01-17"),
+        pd.Timestamp("2025-01-23"),
+        pd.Timestamp("2025-01-29"),
+    ]
+
+    # Verify CSV contains the full assembled range (all 6 rows), not just the trailing gap
+    csv_df = pd.read_csv(tmp_path / "data" / "RELIANCE.NS.csv")
+    assert len(csv_df) == 6
+
+    # 4. Full cache hit on merged Jan 1-31 makes 0 provider calls
+    _ = download_stock_data("RELIANCE.NS", start="2025-01-01", end="2025-01-31")
+    assert len(calls) == 3
+
+    # 5. Multiple gaps around interior coverage in one request (for TCS.NS, seed Jan 10-20, request Jan 1-31)
+    _ = download_stock_data("TCS.NS", start="2025-01-10", end="2025-01-20")
+    assert len(calls) == 4
+    tcs_full = download_stock_data("TCS.NS", start="2025-01-01", end="2025-01-31")
+    assert len(calls) == 6
+    assert calls[-2] == {"start": "2025-01-01", "end": "2025-01-10"}
+    assert calls[-1] == {"start": "2025-01-21", "end": "2025-02-01"}
+    assert len(tcs_full) == 6
+
+
+def test_weekend_empty_gap_between_cached_ranges_returns_cached_data_without_false_coverage_or_csv_write(
+    monkeypatch, tmp_path
+):
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setattr(stock_service, "S3_SYNC_ENABLED", False)
+
+    # Weekday bars only; Jan 4 (Sat) and Jan 5 (Sun) have no trading rows
+    cal_df = _make_calendar_dataset(
+        [
+            "2025-01-01",
+            "2025-01-02",
+            "2025-01-03",
+            "2025-01-06",
+            "2025-01-07",
+            "2025-01-08",
+        ]
+    )
+    calls = []
+    monkeypatch.setattr(
+        stock_service.yf,
+        "Ticker",
+        lambda symbol: CalendarAwareFakeTicker(cal_df, calls),
+    )
+
+    # Seed Wed-Fri (Jan 1-3) and Mon-Wed (Jan 6-8) separately so Jan 4-5 is an uncovered weekend gap
+    _ = download_stock_data("RELIANCE.NS", start="2025-01-01", end="2025-01-03")
+    _ = download_stock_data("RELIANCE.NS", start="2025-01-06", end="2025-01-08")
+    assert len(calls) == 2
+
+    # Remove CSV and enable S3 with a failing guard: since the weekend gap returns empty,
+    # no new rows are persisted, so neither CSV nor S3 should be triggered.
+    csv_path = tmp_path / "data" / "RELIANCE.NS.csv"
+    csv_path.unlink()
+    monkeypatch.setattr(stock_service, "S3_SYNC_ENABLED", True)
+    monkeypatch.setattr(stock_service, "AWS_BUCKET_NAME", "test-bucket")
+    monkeypatch.setattr(
+        stock_service.boto3,
+        "client",
+        lambda *a, **kw: pytest.fail("S3 should not be called when gap fetch persists no new data"),
+    )
+
+    combined = download_stock_data(
+        "RELIANCE.NS", start="2025-01-01", end="2025-01-08"
+    )
+    # Provider was queried only for the missing weekend gap (Jan 4-5 -> exclusive end Jan 6)
+    assert len(calls) == 3
+    assert calls[-1] == {"start": "2025-01-04", "end": "2025-01-06"}
+
+    # Full cached trading data (all 6 weekday bars) is returned, NOT an empty DataFrame
+    assert len(combined) == 6
+    assert not csv_path.exists()
+
+    # Weekend gap was empty, so it must NOT be falsely marked covered
+    repo = _get_repository()
+    assert repo.is_range_covered("RELIANCE.NS", "2025-01-04", "2025-01-05") is False
+
+
+def test_partial_failure_across_multiple_gaps_persists_earlier_gap_and_retries_only_remaining(
+    monkeypatch, tmp_path
+):
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setattr(stock_service, "S3_SYNC_ENABLED", False)
+
+    cal_df = _make_calendar_dataset(
+        [
+            "2025-01-10",
+            "2025-01-20",
+            "2025-02-10",
+            "2025-02-20",
+            "2025-03-10",
+            "2025-03-20",
+        ]
+    )
+    calls = []
+
+    class FailOnMarchTicker(CalendarAwareFakeTicker):
+        def history(self, **kwargs):
+            if kwargs.get("start") == "2025-03-01":
+                self._call_log.append(kwargs)
+                raise RuntimeError("Simulated provider failure on March gap")
+            return super().history(**kwargs)
+
+    monkeypatch.setattr(
+        stock_service.yf,
+        "Ticker",
+        lambda symbol: FailOnMarchTicker(cal_df, calls),
+    )
+
+    # 1. Seed February (2025-02-01..2025-02-28)
+    _ = download_stock_data("INFY.NS", start="2025-02-01", end="2025-02-28")
+    assert len(calls) == 1
+
+    # 2. Request Jan 1 - Mar 31: Gap 1 (Jan) succeeds and commits; Gap 2 (Mar) raises RuntimeError
+    with pytest.raises(RuntimeError, match="Simulated provider failure on March gap"):
+        download_stock_data("INFY.NS", start="2025-01-01", end="2025-03-31")
+
+    assert len(calls) == 3
+    assert calls[1] == {"start": "2025-01-01", "end": "2025-02-01"}
+    assert calls[2] == {"start": "2025-03-01", "end": "2025-04-01"}
+
+    repo = _get_repository()
+    # Earlier successful gap (Jan) is persisted and merged with Feb; failed gap (Mar) is not covered
+    assert repo.is_range_covered("INFY.NS", "2025-01-01", "2025-02-28") is True
+    assert repo.is_range_covered("INFY.NS", "2025-03-01", "2025-03-31") is False
+    assert len(repo.get_stock_data("INFY.NS")) == 4
+
+    # 3. Retry with healthy provider fetches ONLY the remaining March gap
+    monkeypatch.setattr(
+        stock_service.yf,
+        "Ticker",
+        lambda symbol: CalendarAwareFakeTicker(cal_df, calls),
+    )
+    retry_df = download_stock_data("INFY.NS", start="2025-01-01", end="2025-03-31")
+    assert len(calls) == 4
+    assert calls[-1] == {"start": "2025-03-01", "end": "2025-04-01"}
+    assert len(retry_df) == 6
+    assert repo.is_range_covered("INFY.NS", "2025-01-01", "2025-03-31") is True
+
+
+def test_gap_consolidation_threshold_and_per_gap_utc_clamping(
+    monkeypatch, tmp_path
+):
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setattr(stock_service, "S3_SYNC_ENABLED", False)
+
+    all_jan_days = [f"2025-01-{d:02d}" for d in range(1, 26)]
+    cal_df = _make_calendar_dataset(all_jan_days)
+    calls = []
+    monkeypatch.setattr(
+        stock_service.yf,
+        "Ticker",
+        lambda symbol: CalendarAwareFakeTicker(cal_df, calls),
+    )
+
+    # 1. Seed 3 small disjoint islands inside Jan 1-25, creating 4 uncovered gaps (> MAX_SELECTIVE_GAPS=3):
+    # Covered: Jan 4-5, Jan 10-11, Jan 16-17
+    # Missing in Jan 1-25: (Jan 1-3), (Jan 6-9), (Jan 12-15), (Jan 18-25) -> 4 gaps
+    _ = download_stock_data("RELIANCE.NS", start="2025-01-04", end="2025-01-05")
+    _ = download_stock_data("RELIANCE.NS", start="2025-01-10", end="2025-01-11")
+    _ = download_stock_data("RELIANCE.NS", start="2025-01-16", end="2025-01-17")
+    calls.clear()
+
+    consolidated_df = download_stock_data(
+        "RELIANCE.NS", start="2025-01-01", end="2025-01-25"
+    )
+    # Consolidated into ONE provider fetch spanning first gap start (Jan 1) through last gap end (Jan 25)
+    assert len(calls) == 1
+    assert calls[0] == {"start": "2025-01-01", "end": "2025-01-26"}
+    assert len(consolidated_df) == 25
+    repo = _get_repository()
+    assert repo.is_range_covered("RELIANCE.NS", "2025-01-01", "2025-01-25") is True
+
+    # 2. Per-gap UTC completed-date clamping across two gaps
+    # Simulate last completed UTC date = 2025-01-20
+    monkeypatch.setattr(
+        stock_service, "_last_completed_date", lambda: "2025-01-20"
+    )
+    _ = download_stock_data("TCS.NS", start="2025-01-10", end="2025-01-15")
+    calls.clear()
+
+    # Request Jan 1-25 -> Gap 1 (Jan 1-9) is before Jan 20 (fully covered),
+    # Gap 2 (Jan 16-25) is clamped at Jan 20 (only completed rows Jan 16-20 are persisted and covered;
+    # uncompleted rows Jan 21-25 returned by the provider are discarded before persistence)
+    tcs_df = download_stock_data("TCS.NS", start="2025-01-01", end="2025-01-25")
+    assert len(calls) == 2
+    assert len(tcs_df) == 20
+    assert tcs_df.index[-1] == pd.Timestamp("2025-01-20")
+
+    # Verify SQLite does not contain any uncompleted rows beyond 2025-01-20
+    tcs_stored = repo.get_stock_data("TCS.NS")
+    assert len(tcs_stored) == 20
+    assert tcs_stored.index[-1] == pd.Timestamp("2025-01-20")
+
+    # Verify exported CSV also excludes uncompleted rows beyond 2025-01-20
+    tcs_csv = pd.read_csv(tmp_path / "data" / "TCS.NS.csv")
+    assert len(tcs_csv) == 20
+    assert tcs_csv["Date"].iloc[-1] == "2025-01-20"
+
+    assert repo.is_range_covered("TCS.NS", "2025-01-01", "2025-01-20") is True
+    assert repo.is_range_covered("TCS.NS", "2025-01-01", "2025-01-21") is False
+
+
+def test_end_to_end_api_selective_gap_fetch_integration(
+    monkeypatch, tmp_path
+):
+    from fastapi.testclient import TestClient
+    from app.main import app
+
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setattr(stock_service, "S3_SYNC_ENABLED", False)
+
+    cal_df = _make_calendar_dataset(
+        [
+            "2025-01-10",
+            "2025-01-20",
+            "2025-02-10",
+            "2025-02-20",
+            "2025-03-10",
+            "2025-03-20",
+        ]
+    )
+    provider_calls = []
+    monkeypatch.setattr(
+        stock_service.yf,
+        "Ticker",
+        lambda symbol: CalendarAwareFakeTicker(cal_df, provider_calls),
+    )
+
+    api_client = TestClient(app)
+
+    # Step 1: GET /compare seeds January and March ranges (2 provider calls)
+    res_compare = api_client.get(
+        "/compare",
+        params={
+            "symbol": "RELIANCE.NS",
+            "start_a": "2025-01-01",
+            "end_a": "2025-01-31",
+            "start_b": "2025-03-01",
+            "end_b": "2025-03-31",
+        },
+    )
+    assert res_compare.status_code == 200
+    assert len(provider_calls) == 2
+
+    # Step 2: GET /stock for full Q1 (Jan 1 - Mar 31) fetches ONLY the missing February gap
+    res_q1 = api_client.get(
+        "/stock",
+        params={
+            "symbol": "RELIANCE.NS",
+            "start": "2025-01-01",
+            "end": "2025-03-31",
+        },
+    )
+    assert res_q1.status_code == 200
+    assert len(provider_calls) == 3
+    assert provider_calls[-1] == {"start": "2025-02-01", "end": "2025-03-01"}
+
+    q1_dates = [row["Date"][:10] for row in res_q1.json()["history"]]
+    assert q1_dates == [
+        "2025-01-10",
+        "2025-01-20",
+        "2025-02-10",
+        "2025-02-20",
+        "2025-03-10",
+        "2025-03-20",
+    ]
+
+    # Step 3: Repeat GET /stock for Q1 makes 0 additional provider calls
+    res_q1_cached = api_client.get(
+        "/stock",
+        params={
+            "symbol": "RELIANCE.NS",
+            "start": "2025-01-01",
+            "end": "2025-03-31",
+        },
+    )
+    assert res_q1_cached.status_code == 200
+    assert len(provider_calls) == 3
+
+
+
 

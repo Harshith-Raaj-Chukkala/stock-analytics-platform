@@ -726,3 +726,117 @@ def test_atomicity_rolls_back_prices_and_coverage_when_coverage_write_fails(
     assert _read_cached_ranges(repo, "INFY.NS") == [("2025-01-01", "2025-01-02")]
 
 
+def test_get_missing_ranges_across_coverage_scenarios(tmp_path):
+    repo = MarketDataRepository(db_path=tmp_path / "market_data.db")
+    bar = make_canonical_df(dates=["2025-01-02"], closes=[100.0])
+
+    # 1. No coverage -> full requested interval is missing
+    assert repo.get_missing_ranges("RELIANCE.NS", "2025-01-01", "2025-01-31") == [
+        ("2025-01-01", "2025-01-31")
+    ]
+
+    # 2. Partial coverage at beginning (Jan 1-10 covered, req Jan 1-31) -> Jan 11-31 missing
+    repo.upsert_stock_data(
+        "RELIANCE.NS",
+        bar,
+        coverage_start="2025-01-01",
+        coverage_end="2025-01-10",
+    )
+    assert repo.get_missing_ranges("RELIANCE.NS", "2025-01-01", "2025-01-31") == [
+        ("2025-01-11", "2025-01-31")
+    ]
+
+    # 3. Full coverage (exact boundary and interior sub-range) -> []
+    assert repo.get_missing_ranges("RELIANCE.NS", "2025-01-01", "2025-01-10") == []
+    assert repo.get_missing_ranges("reliance.ns", "2025-01-03", "2025-01-08") == []
+
+    # 4. Partial coverage at end (add Jan 20-31, query Jan 12-31) -> Jan 12-19 missing
+    repo.upsert_stock_data(
+        "RELIANCE.NS",
+        bar,
+        coverage_start="2025-01-20",
+        coverage_end="2025-01-31",
+    )
+    assert repo.get_missing_ranges("RELIANCE.NS", "2025-01-12", "2025-01-31") == [
+        ("2025-01-12", "2025-01-19")
+    ]
+
+    # 5. Multiple disjoint intervals (Jan 1-10 and Jan 20-31 covered, query Jan 1-31) -> Jan 11-19 missing
+    assert repo.get_missing_ranges("RELIANCE.NS", "2025-01-01", "2025-01-31") == [
+        ("2025-01-11", "2025-01-19")
+    ]
+
+    # 6. Cached interval strictly inside requested range (add Jan 14-16; query Jan 11-19)
+    # -> two missing gaps: Jan 11-13 and Jan 17-19
+    repo.upsert_stock_data(
+        "RELIANCE.NS",
+        bar,
+        coverage_start="2025-01-14",
+        coverage_end="2025-01-16",
+    )
+    assert repo.get_missing_ranges("RELIANCE.NS", "2025-01-11", "2025-01-19") == [
+        ("2025-01-11", "2025-01-13"),
+        ("2025-01-17", "2025-01-19"),
+    ]
+    # Querying full month Jan 1-31 returns both gaps
+    assert repo.get_missing_ranges("RELIANCE.NS", "2025-01-01", "2025-01-31") == [
+        ("2025-01-11", "2025-01-13"),
+        ("2025-01-17", "2025-01-19"),
+    ]
+
+    # 7. One-day gap (cover Jan 11-13 and Jan 17-18, leaving only Jan 19 uncovered)
+    repo.upsert_stock_data(
+        "RELIANCE.NS",
+        bar,
+        coverage_start="2025-01-11",
+        coverage_end="2025-01-13",
+    )
+    repo.upsert_stock_data(
+        "RELIANCE.NS",
+        bar,
+        coverage_start="2025-01-17",
+        coverage_end="2025-01-18",
+    )
+    assert repo.get_missing_ranges("RELIANCE.NS", "2025-01-01", "2025-01-31") == [
+        ("2025-01-19", "2025-01-19")
+    ]
+
+    # 8. Leap-day handling (2024 is a leap year: Feb 25-28 and Mar 1-5 covered -> 2024-02-29 missing)
+    repo.upsert_stock_data(
+        "LEAP.NS",
+        bar,
+        coverage_start="2024-02-25",
+        coverage_end="2024-02-28",
+    )
+    repo.upsert_stock_data(
+        "LEAP.NS",
+        bar,
+        coverage_start="2024-03-01",
+        coverage_end="2024-03-05",
+    )
+    assert repo.get_missing_ranges("LEAP.NS", "2024-02-25", "2024-03-05") == [
+        ("2024-02-29", "2024-02-29")
+    ]
+
+    # 9. Year-boundary handling (2025-12-25..2025-12-31 covered, query through 2026-01-05)
+    repo.upsert_stock_data(
+        "YEAR.NS",
+        bar,
+        coverage_start="2025-12-25",
+        coverage_end="2025-12-31",
+    )
+    assert repo.get_missing_ranges("YEAR.NS", "2025-12-25", "2026-01-05") == [
+        ("2026-01-01", "2026-01-05")
+    ]
+
+    # 10. Symbol isolation (OTHER.NS has no coverage)
+    assert repo.get_missing_ranges("OTHER.NS", "2025-01-01", "2025-01-10") == [
+        ("2025-01-01", "2025-01-10")
+    ]
+
+    # 11. Reversed dates raise ValueError
+    with pytest.raises(ValueError, match="start date must be before or equal to end date"):
+        repo.get_missing_ranges("RELIANCE.NS", "2025-01-31", "2025-01-01")
+
+
+

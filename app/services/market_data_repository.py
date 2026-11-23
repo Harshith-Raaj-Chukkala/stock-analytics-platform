@@ -279,6 +279,62 @@ class MarketDataRepository:
 
         return row is not None
 
+    def get_missing_ranges(
+        self,
+        symbol: str,
+        start: date | datetime | pd.Timestamp | str,
+        end: date | datetime | pd.Timestamp | str,
+    ) -> list[tuple[str, str]]:
+        """
+        Return a chronologically ordered list of uncovered inclusive (start_date, end_date)
+        ISO calendar-date intervals within [start, end] for `symbol`.
+        """
+        norm_symbol = _normalize_symbol(symbol)
+        start_str = _normalize_query_date(start, "start")
+        end_str = _normalize_query_date(end, "end")
+
+        if start_str is None or end_str is None:
+            raise ValueError("Both start and end dates are required.")
+        if start_str > end_str:
+            raise ValueError("start date must be before or equal to end date.")
+
+        with self._connect() as conn:
+            rows = conn.execute(
+                """
+                SELECT start_date, end_date
+                FROM cached_ranges
+                WHERE symbol = ?
+                  AND start_date <= ?
+                  AND end_date >= ?
+                ORDER BY start_date ASC;
+                """,
+                (norm_symbol, end_str, start_str),
+            ).fetchall()
+
+        req_start_dt = date.fromisoformat(start_str)
+        req_end_dt = date.fromisoformat(end_str)
+        cursor = req_start_dt
+        missing: list[tuple[str, str]] = []
+
+        for cov_start_str, cov_end_str in rows:
+            cov_start_dt = date.fromisoformat(cov_start_str)
+            cov_end_dt = date.fromisoformat(cov_end_str)
+
+            if cov_start_dt > cursor:
+                gap_end_dt = min(req_end_dt, cov_start_dt - timedelta(days=1))
+                missing.append((cursor.isoformat(), gap_end_dt.isoformat()))
+
+            next_day = cov_end_dt + timedelta(days=1)
+            if next_day > cursor:
+                cursor = next_day
+            if cursor > req_end_dt:
+                break
+
+        if cursor <= req_end_dt:
+            missing.append((cursor.isoformat(), req_end_dt.isoformat()))
+
+        return missing
+
     def upsert_stock_data(
         self,
         symbol: str,

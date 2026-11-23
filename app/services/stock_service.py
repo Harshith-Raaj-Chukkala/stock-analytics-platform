@@ -28,6 +28,7 @@ S3_SYNC_ENABLED = os.getenv("S3_SYNC_ENABLED", "false").strip().lower() in (
     "yes",
 )
 DB_PATH = os.getenv("MARKET_DATA_DB_PATH", str(DEFAULT_DB_PATH))
+MAX_SELECTIVE_GAPS = 3
 
 _SYMBOL_PATTERN = re.compile(r"^\^?[A-Z0-9][A-Z0-9.&=\-]{0,29}$")
 
@@ -77,38 +78,57 @@ def download_stock_data(symbol, period="1mo", start=None, end=None):
         raise ValueError("start date must be before or equal to end date.")
 
     repo = _get_repository()
-    if repo.is_range_covered(norm_symbol, req_start, req_end):
+    missing_gaps = repo.get_missing_ranges(norm_symbol, req_start, req_end)
+    if not missing_gaps:
         return repo.get_stock_data(norm_symbol, start=req_start, end=req_end)
 
-    yf_end = (date.fromisoformat(req_end) + timedelta(days=1)).isoformat()
-    ticker = yf.Ticker(norm_symbol)
-    data = ticker.history(start=req_start, end=yf_end)
-    data = validate_and_normalize_stock_data(data, symbol=norm_symbol)
-    data = data.loc[
-        (data.index >= pd.Timestamp(req_start))
-        & (data.index <= pd.Timestamp(req_end))
-    ].copy()
-    if not data.empty:
-        data.index = data.index.normalize()
-        data.index.name = "Date"
-
-    if data.empty:
-        return data
+    if len(missing_gaps) > MAX_SELECTIVE_GAPS:
+        fetch_gaps = [(missing_gaps[0][0], missing_gaps[-1][1])]
+    else:
+        fetch_gaps = missing_gaps
 
     last_completed = _last_completed_date()
-    clamped_end = min(req_end, last_completed)
-    if clamped_end >= req_start:
-        cov_start, cov_end = req_start, clamped_end
-    else:
-        cov_start, cov_end = None, None
+    ticker = yf.Ticker(norm_symbol)
+    persisted_any = False
 
-    repo.upsert_stock_data(
-        symbol=norm_symbol,
-        df=data,
-        mark_full_history=False,
-        coverage_start=cov_start,
-        coverage_end=cov_end,
-    )
+    for gap_start, gap_end in fetch_gaps:
+        yf_end = (date.fromisoformat(gap_end) + timedelta(days=1)).isoformat()
+        gap_data = ticker.history(start=gap_start, end=yf_end)
+        gap_data = validate_and_normalize_stock_data(gap_data, symbol=norm_symbol)
+        gap_data = gap_data.loc[
+            (gap_data.index >= pd.Timestamp(gap_start))
+            & (gap_data.index <= pd.Timestamp(gap_end))
+        ].copy()
+
+        if gap_data.empty:
+            continue
+
+        completed_end = min(gap_end, last_completed)
+        if completed_end < gap_start:
+            continue
+
+        gap_data = gap_data.loc[
+            gap_data.index <= pd.Timestamp(completed_end)
+        ].copy()
+
+        if gap_data.empty:
+            continue
+
+        gap_data.index = gap_data.index.normalize()
+        gap_data.index.name = "Date"
+
+        repo.upsert_stock_data(
+            symbol=norm_symbol,
+            df=gap_data,
+            mark_full_history=False,
+            coverage_start=gap_start,
+            coverage_end=completed_end,
+        )
+        persisted_any = True
+
+    data = repo.get_stock_data(norm_symbol, start=req_start, end=req_end)
+    if not persisted_any or data.empty:
+        return data
  else:
     ticker = yf.Ticker(norm_symbol)
     data = ticker.history(period=period)
