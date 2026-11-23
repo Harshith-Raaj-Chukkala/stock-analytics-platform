@@ -61,8 +61,12 @@ def _validate_and_normalize_symbol(symbol: str) -> str:
     return norm_symbol
 
 
+def _utc_now() -> datetime:
+    return datetime.now(timezone.utc)
+
+
 def _last_completed_date() -> str:
-    return (datetime.now(timezone.utc).date() - timedelta(days=1)).isoformat()
+    return (_utc_now().date() - timedelta(days=1)).isoformat()
 
 
 def download_stock_data(symbol, period="1mo", start=None, end=None):
@@ -117,12 +121,16 @@ def download_stock_data(symbol, period="1mo", start=None, end=None):
         gap_data.index = gap_data.index.normalize()
         gap_data.index.name = "Date"
 
+        qualifies_as_refresh = gap_end >= last_completed
+
         repo.upsert_stock_data(
             symbol=norm_symbol,
             df=gap_data,
             mark_full_history=False,
+            synced_at=_utc_now(),
             coverage_start=gap_start,
             coverage_end=completed_end,
+            mark_refreshed=qualifies_as_refresh,
         )
         persisted_any = True
 
@@ -145,6 +153,8 @@ def download_stock_data(symbol, period="1mo", start=None, end=None):
         symbol=norm_symbol,
         df=data,
         mark_full_history=mark_full_history,
+        synced_at=_utc_now(),
+        mark_refreshed=True,
     )
 
  data_dir = Path("data").resolve()

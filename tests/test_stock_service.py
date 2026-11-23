@@ -1325,5 +1325,143 @@ def test_end_to_end_api_selective_gap_fetch_integration(
     assert len(provider_calls) == 3
 
 
+def test_freshness_metadata_qualification_across_service_flows(
+    monkeypatch, tmp_path
+):
+    from datetime import datetime, timezone
+
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setattr(stock_service, "S3_SYNC_ENABLED", False)
+    # Fix last completed UTC date to 2025-01-20
+    monkeypatch.setattr(
+        stock_service, "_last_completed_date", lambda: "2025-01-20"
+    )
+
+    clock_values = iter(
+        [
+            datetime(2025, 1, 21, 9, 0, 0, tzinfo=timezone.utc),   # T1
+            datetime(2025, 1, 21, 10, 0, 0, tzinfo=timezone.utc),  # T2
+            datetime(2025, 1, 21, 11, 0, 0, tzinfo=timezone.utc),  # T3
+            datetime(2025, 1, 21, 12, 0, 0, tzinfo=timezone.utc),  # T4
+            datetime(2025, 1, 21, 13, 0, 0, tzinfo=timezone.utc),  # T5
+        ]
+    )
+    monkeypatch.setattr(stock_service, "_utc_now", lambda: next(clock_values))
+
+    cal_df = _make_calendar_dataset(
+        [
+            "2025-01-02",
+            "2025-01-08",
+            "2025-01-13",
+            "2025-01-17",
+            "2025-01-20",
+            "2025-01-22",
+        ]
+    )
+    calls = []
+    monkeypatch.setattr(
+        stock_service.yf,
+        "Ticker",
+        lambda symbol: CalendarAwareFakeTicker(cal_df, calls),
+    )
+
+    repo = _get_repository()
+
+    # 1. Purely historical explicit-range fetch (end 2025-01-10 < last_completed 2025-01-20)
+    # -> updates last_synced_at (T1), leaves last_refreshed_at None
+    _ = download_stock_data(
+        "RELIANCE.NS", start="2025-01-01", end="2025-01-10"
+    )
+    meta = repo.get_metadata("RELIANCE.NS")
+    assert meta.last_synced_at == "2025-01-21T09:00:00+00:00"
+    assert meta.last_refreshed_at is None
+
+    # 2. Explicit-range fetch reaching recent edge (end 2025-01-20 >= last_completed 2025-01-20)
+    # -> gap 2025-01-11..2025-01-20 qualifies and updates both timestamps to T2
+    _ = download_stock_data(
+        "RELIANCE.NS", start="2025-01-01", end="2025-01-20"
+    )
+    meta = repo.get_metadata("RELIANCE.NS")
+    assert meta.last_synced_at == "2025-01-21T10:00:00+00:00"
+    assert meta.last_refreshed_at == "2025-01-21T10:00:00+00:00"
+
+    # 3. Full cache hit changes neither timestamp (and does not consume clock_values)
+    _ = download_stock_data(
+        "RELIANCE.NS", start="2025-01-01", end="2025-01-20"
+    )
+    meta = repo.get_metadata("RELIANCE.NS")
+    assert meta.last_synced_at == "2025-01-21T10:00:00+00:00"
+    assert meta.last_refreshed_at == "2025-01-21T10:00:00+00:00"
+
+    # 4. Period fetch on TCS.NS qualifies (T3), and a subsequent historical backfill (T4)
+    # updates last_synced_at to T4 while preserving last_refreshed_at at T3
+    period_slice = _make_calendar_dataset(["2025-01-17", "2025-01-20"])
+    monkeypatch.setattr(
+        stock_service.yf,
+        "Ticker",
+        lambda symbol: FakeTicker(period_slice, calls),
+    )
+    _ = download_stock_data("TCS.NS", period="5d")
+    tcs_meta = repo.get_metadata("TCS.NS")
+    assert tcs_meta.last_synced_at == "2025-01-21T11:00:00+00:00"
+    assert tcs_meta.last_refreshed_at == "2025-01-21T11:00:00+00:00"
+
+    monkeypatch.setattr(
+        stock_service.yf,
+        "Ticker",
+        lambda symbol: CalendarAwareFakeTicker(cal_df, calls),
+    )
+    _ = download_stock_data("TCS.NS", start="2025-01-01", end="2025-01-10")
+    tcs_meta = repo.get_metadata("TCS.NS")
+    assert tcs_meta.last_synced_at == "2025-01-21T12:00:00+00:00"
+    assert tcs_meta.last_refreshed_at == "2025-01-21T11:00:00+00:00"
+
+    # 5. Skipped uncompleted gap (2025-01-21..2025-01-25 > last_completed) and empty responses
+    # do not modify timestamps
+    _ = download_stock_data("TCS.NS", start="2025-01-21", end="2025-01-25")
+    assert repo.get_metadata("TCS.NS") == tcs_meta
+
+    monkeypatch.setattr(
+        stock_service.yf,
+        "Ticker",
+        lambda symbol: FakeTicker(pd.DataFrame(), calls),
+    )
+    _ = download_stock_data("TCS.NS", period="1mo")
+    assert repo.get_metadata("TCS.NS") == tcs_meta
+
+    # 6. Partial multi-gap failure: seed middle range 2025-01-11..2025-01-15 on INFY.NS,
+    # then request 2025-01-01..2025-01-20 where Gap 1 (Jan 1-10, historical) succeeds at T5
+    # and Gap 2 (Jan 16-20, recent-edge) fails -> last_synced_at is T5, last_refreshed_at remains None
+    class FailOnRecentEdgeTicker(CalendarAwareFakeTicker):
+        def history(self, **kwargs):
+            if kwargs.get("start") == "2025-01-16":
+                raise RuntimeError("Simulated recent-edge gap failure")
+            return super().history(**kwargs)
+
+    # Seed Jan 11-15 using repo directly so clock T5 is reserved for Gap 1
+    repo.upsert_stock_data(
+        "INFY.NS",
+        _make_calendar_dataset(["2025-01-13"]).assign(
+            Dividends=0.0, **{"Stock Splits": 0.0}
+        ),
+        synced_at="2025-01-21T08:00:00+00:00",
+        coverage_start="2025-01-11",
+        coverage_end="2025-01-15",
+        mark_refreshed=False,
+    )
+    monkeypatch.setattr(
+        stock_service.yf,
+        "Ticker",
+        lambda symbol: FailOnRecentEdgeTicker(cal_df, calls),
+    )
+    with pytest.raises(RuntimeError, match="Simulated recent-edge gap failure"):
+        download_stock_data("INFY.NS", start="2025-01-01", end="2025-01-20")
+
+    infy_meta = repo.get_metadata("INFY.NS")
+    assert infy_meta.last_synced_at == "2025-01-21T13:00:00+00:00"
+    assert infy_meta.last_refreshed_at is None
+
+
+
 
 

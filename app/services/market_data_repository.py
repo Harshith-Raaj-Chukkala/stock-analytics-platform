@@ -28,6 +28,7 @@ class SymbolMetadata:
     - last_synced_at: ISO-8601 UTC timestamp string (e.g. "2025-01-15T10:30:00+00:00").
     - has_full_history: True if full available history has ever been marked for this symbol.
     - row_count: Total number of stored daily bars for this symbol.
+    - last_refreshed_at: ISO-8601 UTC timestamp string of the last recent-edge refresh, or None.
     """
 
     symbol: str
@@ -36,6 +37,7 @@ class SymbolMetadata:
     last_synced_at: str
     has_full_history: bool
     row_count: int
+    last_refreshed_at: str | None = None
 
 
 def _normalize_symbol(symbol: str) -> str:
@@ -229,10 +231,21 @@ class MarketDataRepository:
                     max_date TEXT NOT NULL,
                     last_synced_at TEXT NOT NULL,
                     has_full_history INTEGER NOT NULL DEFAULT 0,
-                    row_count INTEGER NOT NULL DEFAULT 0
+                    row_count INTEGER NOT NULL DEFAULT 0,
+                    last_refreshed_at TEXT
                 );
                 """
             )
+            existing_meta_cols = {
+                row[1]
+                for row in conn.execute(
+                    "PRAGMA table_info(ingestion_metadata);"
+                ).fetchall()
+            }
+            if "last_refreshed_at" not in existing_meta_cols:
+                conn.execute(
+                    "ALTER TABLE ingestion_metadata ADD COLUMN last_refreshed_at TEXT;"
+                )
             conn.execute(
                 """
                 CREATE TABLE IF NOT EXISTS cached_ranges (
@@ -343,6 +356,7 @@ class MarketDataRepository:
         synced_at: datetime | str | None = None,
         coverage_start: date | datetime | pd.Timestamp | str | None = None,
         coverage_end: date | datetime | pd.Timestamp | str | None = None,
+        mark_refreshed: bool = False,
     ) -> int:
         """
         Atomically upsert canonical daily OHLCV rows, recalculate ingestion metadata,
@@ -351,12 +365,13 @@ class MarketDataRepository:
         Empty DataFrame behavior:
         - After validating arguments, an empty DataFrame is a strict no-op returning `0`:
           it does not insert prices, update metadata, promote `has_full_history`,
-          or modify `cached_ranges`.
+          update `last_refreshed_at`, or modify `cached_ranges`.
         """
         norm_symbol = _normalize_symbol(symbol)
         _verify_canonical_dataframe(df)
         norm_synced_at = _normalize_synced_at(synced_at)
         full_history_flag = 1 if bool(mark_full_history) else 0
+        refreshed_at_val = norm_synced_at if bool(mark_refreshed) else None
 
         if (coverage_start is None) != (coverage_end is None):
             raise ValueError(
@@ -427,15 +442,16 @@ class MarketDataRepository:
             conn.execute(
                 """
                 INSERT INTO ingestion_metadata (
-                    symbol, min_date, max_date, last_synced_at, has_full_history, row_count
+                    symbol, min_date, max_date, last_synced_at, has_full_history, row_count, last_refreshed_at
                 )
-                VALUES (?, ?, ?, ?, ?, ?)
+                VALUES (?, ?, ?, ?, ?, ?, ?)
                 ON CONFLICT(symbol) DO UPDATE SET
                     min_date = excluded.min_date,
                     max_date = excluded.max_date,
                     last_synced_at = excluded.last_synced_at,
                     has_full_history = MAX(ingestion_metadata.has_full_history, excluded.has_full_history),
-                    row_count = excluded.row_count;
+                    row_count = excluded.row_count,
+                    last_refreshed_at = COALESCE(excluded.last_refreshed_at, ingestion_metadata.last_refreshed_at);
                 """,
                 (
                     norm_symbol,
@@ -444,6 +460,7 @@ class MarketDataRepository:
                     norm_synced_at,
                     full_history_flag,
                     int(row_count),
+                    refreshed_at_val,
                 ),
             )
 
@@ -535,7 +552,7 @@ class MarketDataRepository:
         with self._connect() as conn:
             row = conn.execute(
                 """
-                SELECT symbol, min_date, max_date, last_synced_at, has_full_history, row_count
+                SELECT symbol, min_date, max_date, last_synced_at, has_full_history, row_count, last_refreshed_at
                 FROM ingestion_metadata
                 WHERE symbol = ?;
                 """,
@@ -552,6 +569,7 @@ class MarketDataRepository:
             last_synced_at=row[3],
             has_full_history=bool(row[4]),
             row_count=int(row[5]),
+            last_refreshed_at=row[6],
         )
 
     def get_latest_row(self, symbol: str) -> pd.DataFrame:

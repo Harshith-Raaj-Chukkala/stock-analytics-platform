@@ -101,6 +101,7 @@ def test_schema_and_parent_directory_auto_creation(tmp_path):
             "last_synced_at",
             "has_full_history",
             "row_count",
+            "last_refreshed_at",
         ]
 
         # Confirm redundant explicit index is not created (composite PK provides the autoindex)
@@ -837,6 +838,151 @@ def test_get_missing_ranges_across_coverage_scenarios(tmp_path):
     # 11. Reversed dates raise ValueError
     with pytest.raises(ValueError, match="start date must be before or equal to end date"):
         repo.get_missing_ranges("RELIANCE.NS", "2025-01-31", "2025-01-01")
+
+
+def test_legacy_database_migration_adds_last_refreshed_at_idempotently(tmp_path):
+    db_path = tmp_path / "legacy_market_data.db"
+
+    # Create a pre-M4.4a database without last_refreshed_at in ingestion_metadata
+    with sqlite3.connect(db_path) as conn:
+        conn.execute(
+            """
+            CREATE TABLE daily_prices (
+                symbol TEXT NOT NULL,
+                trade_date TEXT NOT NULL,
+                open REAL NOT NULL,
+                high REAL NOT NULL,
+                low REAL NOT NULL,
+                close REAL NOT NULL,
+                volume INTEGER NOT NULL,
+                dividends REAL NOT NULL,
+                stock_splits REAL NOT NULL,
+                PRIMARY KEY (symbol, trade_date)
+            );
+            """
+        )
+        conn.execute(
+            """
+            CREATE TABLE ingestion_metadata (
+                symbol TEXT PRIMARY KEY,
+                min_date TEXT NOT NULL,
+                max_date TEXT NOT NULL,
+                last_synced_at TEXT NOT NULL,
+                has_full_history INTEGER NOT NULL DEFAULT 0,
+                row_count INTEGER NOT NULL DEFAULT 0
+            );
+            """
+        )
+        conn.execute(
+            """
+            INSERT INTO ingestion_metadata (
+                symbol, min_date, max_date, last_synced_at, has_full_history, row_count
+            )
+            VALUES ('RELIANCE.NS', '2025-01-01', '2025-01-10', '2025-01-10T10:00:00+00:00', 0, 8);
+            """
+        )
+
+    # First initialization performs ALTER TABLE; second verifies idempotency
+    repo1 = MarketDataRepository(db_path=db_path)
+    repo2 = MarketDataRepository(db_path=db_path)
+
+    meta = repo2.get_metadata("RELIANCE.NS")
+    assert meta == SymbolMetadata(
+        symbol="RELIANCE.NS",
+        min_date="2025-01-01",
+        max_date="2025-01-10",
+        last_synced_at="2025-01-10T10:00:00+00:00",
+        has_full_history=False,
+        row_count=8,
+        last_refreshed_at=None,
+    )
+    assert repo1.get_metadata("RELIANCE.NS") == meta
+
+
+def test_last_refreshed_at_qualified_non_qualified_empty_and_rollback(
+    tmp_path, monkeypatch
+):
+    repo = MarketDataRepository(db_path=tmp_path / "market_data.db")
+
+    t1 = datetime(2025, 1, 10, 9, 0, 0, tzinfo=timezone.utc)
+    t2 = datetime(2025, 1, 10, 12, 0, 0, tzinfo=timezone.utc)
+    t3 = datetime(2025, 1, 11, 8, 30, 0, tzinfo=timezone.utc)
+    t4 = datetime(2025, 1, 12, 10, 0, 0, tzinfo=timezone.utc)
+    t5 = datetime(2025, 1, 13, 14, 0, 0, tzinfo=timezone.utc)
+
+    # 1. Non-qualified initial historical upsert sets last_synced_at, leaves last_refreshed_at None
+    batch1 = make_canonical_df(dates=["2025-01-05"], closes=[100.0])
+    repo.upsert_stock_data(
+        "TCS.NS", batch1, synced_at=t1, mark_refreshed=False
+    )
+    meta1 = repo.get_metadata("TCS.NS")
+    assert meta1.last_synced_at == "2025-01-10T09:00:00+00:00"
+    assert meta1.last_refreshed_at is None
+
+    # 2. Qualified refresh updates both last_synced_at and last_refreshed_at to identical UTC timestamp
+    batch2 = make_canonical_df(dates=["2025-01-10"], closes=[105.0])
+    repo.upsert_stock_data(
+        "TCS.NS", batch2, synced_at=t2, mark_refreshed=True
+    )
+    meta2 = repo.get_metadata("TCS.NS")
+    assert meta2.last_synced_at == "2025-01-10T12:00:00+00:00"
+    assert meta2.last_refreshed_at == "2025-01-10T12:00:00+00:00"
+
+    # 3. Non-qualified historical backfill updates last_synced_at but preserves previous last_refreshed_at
+    batch3 = make_canonical_df(dates=["2025-01-02"], closes=[98.0])
+    repo.upsert_stock_data(
+        "TCS.NS", batch3, synced_at=t3, mark_refreshed=False
+    )
+    meta3 = repo.get_metadata("TCS.NS")
+    assert meta3.last_synced_at == "2025-01-11T08:30:00+00:00"
+    assert meta3.last_refreshed_at == "2025-01-10T12:00:00+00:00"
+
+    # 4. Empty DataFrame upsert with mark_refreshed=True changes neither timestamp
+    repo.upsert_stock_data(
+        "TCS.NS", pd.DataFrame(), synced_at=t4, mark_refreshed=True
+    )
+    meta4 = repo.get_metadata("TCS.NS")
+    assert meta4.last_synced_at == "2025-01-11T08:30:00+00:00"
+    assert meta4.last_refreshed_at == "2025-01-10T12:00:00+00:00"
+
+    # 5. Failed transaction with mark_refreshed=True rolls back and changes neither timestamp
+    original_connect = repo._connect
+
+    class FailingMetadataConnection:
+        def __init__(self, real_conn):
+            self._real_conn = real_conn
+
+        def executemany(self, sql, params):
+            return self._real_conn.executemany(sql, params)
+
+        def execute(self, sql, params=()):
+            if "INSERT INTO ingestion_metadata" in sql:
+                raise sqlite3.OperationalError("Simulated metadata failure")
+            return self._real_conn.execute(sql, params)
+
+    from contextlib import contextmanager
+
+    @contextmanager
+    def failing_connect():
+        raw_conn = sqlite3.connect(repo.db_path)
+        try:
+            with raw_conn:
+                yield FailingMetadataConnection(raw_conn)
+        finally:
+            raw_conn.close()
+
+    monkeypatch.setattr(repo, "_connect", failing_connect)
+    batch5 = make_canonical_df(dates=["2025-01-13"], closes=[110.0])
+    with pytest.raises(sqlite3.OperationalError, match="Simulated metadata failure"):
+        repo.upsert_stock_data(
+            "TCS.NS", batch5, synced_at=t5, mark_refreshed=True
+        )
+
+    monkeypatch.setattr(repo, "_connect", original_connect)
+    meta5 = repo.get_metadata("TCS.NS")
+    assert meta5.last_synced_at == "2025-01-11T08:30:00+00:00"
+    assert meta5.last_refreshed_at == "2025-01-10T12:00:00+00:00"
+
 
 
 
