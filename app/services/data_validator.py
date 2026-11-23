@@ -25,11 +25,35 @@ def _empty_canonical_df() -> pd.DataFrame:
     )
 
 
+_BOOL_LIKE = (bool, np.bool_)
+_INT64_MAX = int(np.iinfo(np.int64).max)
+_FLOAT64_INT64_EXCLUSIVE_UPPER = float(2**63)
+
+
+def _has_bool_mask(series: pd.Series) -> pd.Series:
+    if pd.api.types.is_bool_dtype(series):
+        return pd.Series(True, index=series.index)
+    if series.dtype == object:
+        return series.map(lambda v: isinstance(v, _BOOL_LIKE))
+    return pd.Series(False, index=series.index)
+
+
 def _parse_local_date(value) -> pd.Timestamp:
-    if value is None or isinstance(value, (bool, int, float, np.integer, np.floating)):
+    if value is None or isinstance(
+        value, (bool, int, float, np.bool_, np.integer, np.floating)
+    ):
         return pd.NaT
     if pd.isna(value):
         return pd.NaT
+    if isinstance(value, str):
+        stripped = value.strip()
+        if not stripped:
+            return pd.NaT
+        try:
+            float(stripped)
+            return pd.NaT
+        except ValueError:
+            pass
     try:
         ts = pd.Timestamp(value)
     except (ValueError, TypeError):
@@ -71,6 +95,9 @@ def validate_and_normalize_stock_data(
     df = raw_df.copy()
     df.columns = [col.strip() if isinstance(col, str) else col for col in df.columns]
 
+    if pd.Index(df.columns).duplicated().any():
+        raise ValueError("Duplicate column names are not supported.")
+
     if df.empty and len(df.columns) == 0:
         return _empty_canonical_df()
 
@@ -110,21 +137,36 @@ def validate_and_normalize_stock_data(
     valid_numeric_mask = pd.Series(True, index=df.index)
 
     for col in price_cols:
+        bool_mask = _has_bool_mask(df[col])
         coerced = pd.to_numeric(df[col], errors="coerce")
         df[col] = coerced
-        valid_numeric_mask &= coerced.notna() & np.isfinite(coerced) & (coerced > 0)
+        valid_numeric_mask &= (
+            (~bool_mask) & coerced.notna() & np.isfinite(coerced) & (coerced > 0)
+        )
 
+    vol_bool_mask = _has_bool_mask(df["Volume"])
     vol_coerced = pd.to_numeric(df["Volume"], errors="coerce")
     df["Volume"] = vol_coerced
-    valid_volume = (
-        vol_coerced.notna()
-        & np.isfinite(vol_coerced)
-        & (vol_coerced >= 0)
-        & (np.floor(vol_coerced) == vol_coerced)
-    )
+    if pd.api.types.is_integer_dtype(vol_coerced.dtype):
+        valid_volume = (
+            (~vol_bool_mask)
+            & vol_coerced.notna()
+            & (vol_coerced >= 0)
+            & (vol_coerced <= _INT64_MAX)
+        )
+    else:
+        valid_volume = (
+            (~vol_bool_mask)
+            & vol_coerced.notna()
+            & np.isfinite(vol_coerced)
+            & (vol_coerced >= 0)
+            & (vol_coerced < _FLOAT64_INT64_EXCLUSIVE_UPPER)
+            & (np.floor(vol_coerced) == vol_coerced)
+        )
     valid_numeric_mask &= valid_volume
 
     for col in OPTIONAL_COLUMNS:
+        bool_mask = _has_bool_mask(df[col])
         originally_missing = df[col].isna()
         coerced = pd.to_numeric(df[col], errors="coerce")
         # Non-null values that failed numeric conversion are invalid rows
@@ -132,7 +174,8 @@ def validate_and_normalize_stock_data(
         coerced = coerced.where(~originally_missing, 0.0)
         df[col] = coerced
         valid_numeric_mask &= (
-            (~invalid_unparseable)
+            (~bool_mask)
+            & (~invalid_unparseable)
             & coerced.notna()
             & np.isfinite(coerced)
             & (coerced >= 0)
